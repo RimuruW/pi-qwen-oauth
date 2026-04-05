@@ -1,6 +1,6 @@
 {
   "name": "pi-extension-qwen-oauth-models",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Qwen OAuth provider for pi using the Qwen Portal OpenAI-compatible API.",
   "type": "module",
   "keywords": [

@@ -3,6 +3,11 @@
  *
  * Registers Qwen OAuth device login and the current Qwen OAuth model aliases
  * exposed through the Qwen Portal OpenAI-compatible chat completions API.
+ *
+ * The Qwen Portal API only supports `enable_thinking: true/false` (boolean),
+ * not `thinking_budget`. pi-ai's `thinkingFormat: "qwen"` maps the TUI
+ * reasoning effort selector to this boolean, so thinking can be toggled on/off
+ * but effort granularity is not supported by the Qwen Portal API.
  */
 
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@mariozechner/pi-ai";
@@ -17,19 +22,6 @@ const QWEN_DEFAULT_BASE_URL = "https://portal.qwen.ai/v1";
 const QWEN_DEFAULT_POLL_INTERVAL_MS = 2000;
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 const QWEN_PORTAL_USER_AGENT = "QwenCode/0.13.2 (darwin; arm64)";
-
-/**
- * Qwen Code maps effort levels to thinking_budget (max tokens for internal reasoning).
- * These values match Qwen Code's official defaults for models with >= 128K context.
- * See: QwenLM/qwen-code packages/core/src/core/openaiContentGenerator/pipeline.ts
- */
-const QWEN_THINKING_BUDGET: Record<string, number> = {
-	minimal: 1_000,
-	low: 8_000,
-	medium: 32_000,
-	high: 64_000,
-	xhigh: 128_000,
-};
 
 interface DeviceCodeResponse {
 	device_code: string;
@@ -163,22 +155,7 @@ function normalizeQwenPortalPayload(payload: unknown): unknown {
 		}
 	}
 
-	// Convert pi-ai's reasoning.effort (sent via thinkingFormat: "openrouter")
-	// to the Qwen OAuth API's thinking_budget + enable_thinking.
-	// Qwen Code officially sends { reasoning: { effort: "medium" } } for its
-	// OpenAI-compatible endpoint; the Qwen Portal API expects numeric thinking_budget.
-	const result: Record<string, unknown> = { ...payload, messages };
-	const reasoning = result.reasoning;
-	if (isRecord(reasoning) && typeof reasoning.effort === "string") {
-		const budget = QWEN_THINKING_BUDGET[reasoning.effort];
-		if (budget !== undefined) {
-			result.enable_thinking = true;
-			result.thinking_budget = budget;
-		}
-		delete result.reasoning;
-	}
-
-	return result;
+	return { ...payload, messages };
 }
 
 function computeExpiry(expiresInSeconds: number): number {
@@ -369,9 +346,8 @@ export default function registerQwenOAuthProvider(pi: ExtensionAPI) {
 			maxTokens: model.maxTokens,
 			compat: {
 				supportsDeveloperRole: false,
-				supportsReasoningEffort: true,
 				maxTokensField: "max_tokens",
-				...(model.reasoning ? { thinkingFormat: "openrouter" as const } : {}),
+				...(model.reasoning ? { thinkingFormat: "qwen" as const } : {}),
 			},
 		})),
 		oauth: {
