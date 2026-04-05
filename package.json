@@ -1,0 +1,34 @@
+{
+  "name": "pi-extension-qwen-oauth-models",
+  "version": "0.1.0",
+  "description": "Qwen OAuth provider for pi using the Qwen Portal OpenAI-compatible API.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "qwen",
+    "oauth"
+  ],
+  "files": [
+    "index.ts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "echo 'No build step required: pi loads TypeScript extensions directly'",
+    "check": "node --experimental-strip-types --test tests/*.test.ts",
+    "prepack": "npm run check"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
