@@ -7,7 +7,7 @@ type ProviderRegistration = {
 	name: string;
 	config: {
 		baseUrl: string;
-		models: Array<{ id: string; compat?: { thinkingFormat?: string; supportsReasoningEffort?: boolean } }>;
+		models: Array<{ id: string; compat?: { thinkingFormat?: string } }>;
 		headers?: Record<string, string>;
 		oauth?: {
 			modifyModels?: (models: Array<{ provider: string; baseUrl?: string }>, credentials: { enterpriseUrl?: string }) => Array<{ provider: string; baseUrl?: string }>;
@@ -153,96 +153,10 @@ test("leaves non-Qwen payloads untouched", () => {
 	assert.deepEqual(beforeProviderRequest({ payload }), payload);
 });
 
-test("converts reasoning.effort to thinking_budget + enable_thinking for Qwen models", () => {
-	const { beforeProviderRequest } = registerExtension();
-	if (!beforeProviderRequest) {
-		throw new Error("Expected before_provider_request handler to be registered");
-	}
-
-	const normalized = beforeProviderRequest({
-		payload: {
-			model: "coder-model",
-			messages: [{ role: "user", content: "hi" }],
-			reasoning: { effort: "medium" },
-		},
-	}) as { thinking_budget?: number; enable_thinking?: boolean; reasoning?: unknown };
-
-	assert.equal(normalized.thinking_budget, 32_000);
-	assert.equal(normalized.enable_thinking, true);
-	assert.equal(normalized.reasoning, undefined);
-});
-
-test("maps all effort levels to correct thinking_budget + enable_thinking values", () => {
-	const { beforeProviderRequest } = registerExtension();
-	if (!beforeProviderRequest) {
-		throw new Error("Expected before_provider_request handler to be registered");
-	}
-
-	const effortToBudget: Record<string, number> = {
-		minimal: 1_000,
-		low: 8_000,
-		medium: 32_000,
-		high: 64_000,
-		xhigh: 128_000,
-	};
-
-	for (const [effort, budget] of Object.entries(effortToBudget)) {
-		const normalized = beforeProviderRequest({
-			payload: {
-				model: "coder-model",
-				messages: [{ role: "user", content: "hi" }],
-				reasoning: { effort },
-			},
-		}) as { thinking_budget?: number; enable_thinking?: boolean };
-
-		assert.equal(normalized.thinking_budget, budget, `effort "${effort}" should map to thinking_budget ${budget}`);
-		assert.equal(normalized.enable_thinking, true, `effort "${effort}" should set enable_thinking`);
-	}
-});
-
-test("registers models with thinkingFormat openrouter and supportsReasoningEffort", () => {
+test("uses thinkingFormat qwen to map effort to enable_thinking boolean", () => {
 	const { registration } = registerExtension();
 
-	const coderModel = registration.config.models.find((m) => m.id === "coder-model");
-	assert.ok(coderModel);
-	assert.equal(coderModel.compat?.thinkingFormat, "openrouter");
-	assert.equal(coderModel.compat?.supportsReasoningEffort, true);
-
-	const visionModel = registration.config.models.find((m) => m.id === "vision-model");
-	assert.ok(visionModel);
-	assert.equal(visionModel.compat?.thinkingFormat, "openrouter");
-	assert.equal(visionModel.compat?.supportsReasoningEffort, true);
-});
-
-test("ignores unknown effort values", () => {
-	const { beforeProviderRequest } = registerExtension();
-	if (!beforeProviderRequest) {
-		throw new Error("Expected before_provider_request handler to be registered");
+	for (const model of registration.config.models) {
+		assert.equal(model.compat?.thinkingFormat, "qwen", `model ${model.id} should use thinkingFormat "qwen"`);
 	}
-
-	const normalized = beforeProviderRequest({
-		payload: {
-			model: "coder-model",
-			messages: [{ role: "user", content: "hi" }],
-			reasoning: { effort: "unknown_level" },
-		},
-	}) as { thinking_budget?: number };
-
-	assert.equal(normalized.thinking_budget, undefined);
-});
-
-test("does not add thinking_budget when reasoning is absent", () => {
-	const { beforeProviderRequest } = registerExtension();
-	if (!beforeProviderRequest) {
-		throw new Error("Expected before_provider_request handler to be registered");
-	}
-
-	const normalized = beforeProviderRequest({
-		payload: {
-			model: "coder-model",
-			messages: [{ role: "user", content: "hi" }],
-		},
-	}) as { thinking_budget?: number };
-
-	assert.equal(normalized.thinking_budget, undefined);
 });

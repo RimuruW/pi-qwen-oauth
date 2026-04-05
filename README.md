@@ -1,126 +1,104 @@
-# pi-extension-qwen-oauth-models
+# pi-qwen-oauth
 
-Qwen OAuth provider for [pi](https://github.com/badlogic/pi-mono) that logs in with your `qwen.ai` account and sends chat requests to the correct Qwen Portal API.
+[![npm version](https://img.shields.io/npm/v/pi-qwen-oauth.svg)](https://www.npmjs.com/package/pi-qwen-oauth)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/RimuruW/pi-qwen-oauth/blob/main/LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/RimuruW/pi-qwen-oauth.svg)](https://github.com/RimuruW/pi-qwen-oauth)
 
-## Why this package exists
+Qwen OAuth provider for [pi](https://github.com/badlogic/pi-mono). Log in with your qwen.ai account and use Qwen models via the Qwen Portal OpenAI-compatible API.
 
-Qwen has multiple public API surfaces:
-
-- **Qwen OAuth / qwen.ai account** → `https://portal.qwen.ai/v1`
-- **Alibaba Cloud / DashScope API key** → `https://dashscope.aliyuncs.com/compatible-mode/v1`
-- **Alibaba Cloud Coding Plan API key** → `https://coding.dashscope.aliyuncs.com/v1`
-
-This package is specifically for the **free Qwen OAuth flow** exposed by `chat.qwen.ai` device login.
-
-The common integration mistake is to authenticate with Qwen OAuth successfully, then keep sending model requests to DashScope-compatible paths such as `/compatible-mode/v1`. For Qwen Portal hosts, that yields `404` responses. This package fixes that by routing OAuth sessions to:
-
-- `POST https://chat.qwen.ai/api/v1/oauth2/device/code`
-- `POST https://chat.qwen.ai/api/v1/oauth2/token`
-- `POST https://portal.qwen.ai/v1/chat/completions`
+> [Qwen](https://qwenlm.github.io/) is a powerful family of large language models developed by Alibaba Cloud's Tongyi Lab, excelling in reasoning, coding, and multilingual tasks. This project was built with the assistance of Qwen 3.6 Plus — most of the implementation and documentation were authored by the model itself.
 
 ## Features
 
-- Qwen OAuth device-code login with PKCE
-- Automatic access-token refresh
-- Correct `resource_url` normalization for Qwen Portal vs DashScope hosts
-- Qwen Portal request normalization for OAuth-only header and system-message compatibility
-- Current Qwen OAuth model aliases aligned with open-source Qwen Code integrations
-- Packaged as a pi extension, ready for npm distribution
+- **OAuth Device Code login** with PKCE — authenticate via `chat.qwen.ai` without managing API keys
+- **Automatic token refresh** — seamless session continuity
+- **Correct endpoint routing** — OAuth sessions route to `https://portal.qwen.ai/v1`, DashScope hosts fall back to `/compatible-mode/v1`
+- **Request normalization** — system messages formatted as Qwen Portal-compatible content parts
+- **Thinking mode** — toggle thinking on/off via the TUI reasoning selector (Qwen Portal API supports `enable_thinking` as a boolean)
+- **Model aliases** aligned with the official [Qwen Code](https://github.com/QwenLM/qwen-code) OAuth integration
 
-## Installation
+## Quick Start
 
-### From npm
-
-After publishing:
+### Install
 
 ```bash
-pi install npm:pi-extension-qwen-oauth-models
-```
+# Via pi package manager
+pi install npm:pi-qwen-oauth
 
-Or add it to `~/.pi/agent/settings.json` or `.pi/settings.json`:
-
-```json
-{
-  "packages": [
-    "npm:pi-extension-qwen-oauth-models"
-  ]
-}
-```
-
-### From a local checkout
-
-```bash
+# Or from source
+git clone https://github.com/RimuruW/pi-qwen-oauth.git
+cd pi-qwen-oauth
 pi install .
 ```
 
-Or for one-off testing:
+### Use
 
-```bash
-pi -e .
+```text
+# Log in with Qwen OAuth
+/login qwen-oauth
+
+# Follow the browser/device-code flow in your browser
+
+# Select a model
+/model qwen-oauth/coder-model
 ```
 
-## Usage
+## Models
 
-1. Start `pi`
-2. Run:
+| Alias | Input | Context | Max Tokens | Reasoning |
+|---|---|---|---|---|
+| `qwen-oauth/coder-model` | text | 1M | 65,536 | ✅ |
+| `qwen-oauth/vision-model` | text, image | 262K | 32,768 | ✅ |
 
-   ```text
-   /login qwen-oauth
-   ```
+These aliases track the models currently available through Qwen OAuth accounts. They do not cover the full DashScope model catalog — only what the OAuth token grants access to.
 
-3. Complete the browser/device-code flow
-4. Select a model, for example:
+## Thinking Mode
 
-   ```text
-   /model
-   ```
+Both models have reasoning enabled. The pi TUI displays a thinking effort selector (off / minimal / low / medium / high). The Qwen Portal API only accepts `enable_thinking` as a boolean:
 
-Available models exposed by this package:
+| TUI Selection | API Parameter |
+|---|---|
+| off | `enable_thinking: false` |
+| minimal / low / medium / high | `enable_thinking: true` |
 
-- `qwen-oauth/coder-model`
-- `qwen-oauth/vision-model`
+Granular `thinking_budget` control is not supported by the Qwen Portal API — the model uses its own internal reasoning budget when thinking is enabled.
 
-## Model mapping
+## Why This Exists
 
-This package intentionally exposes the **Qwen OAuth aliases**, not the larger Alibaba Cloud model catalog.
+Qwen exposes multiple API surfaces with different authentication flows:
 
-Current aliases used here:
+| Auth Method | Endpoint |
+|---|---|
+| Qwen OAuth (qwen.ai account) | `https://portal.qwen.ai/v1` |
+| Alibaba Cloud / DashScope API key | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 
-| Alias | Purpose | Input |
-| --- | --- | --- |
-| `coder-model` | Coding/default Qwen OAuth model | text |
-| `vision-model` | Vision-capable Qwen OAuth model | text, image |
+A common mistake is authenticating with Qwen OAuth but sending requests to DashScope paths, which returns `404`. This extension handles the full OAuth device-code flow and routes requests to the correct endpoint.
 
-These aliases track the current Qwen Code OAuth behavior instead of assuming every DashScope model is available to free OAuth accounts.
+## Project Structure
 
-## Verification
-
-Run the package checks:
-
-```bash
-npm run check
+```
+├── index.ts                  # Extension entry point — provider registration & OAuth flow
+├── tests/
+│   └── qwen-oauth.test.ts    # Provider & normalization tests
+├── package.json
+└── README.md
 ```
 
-The check suite verifies:
+No build step — pi loads TypeScript extensions directly via `node --experimental-strip-types`.
 
-- default base URL is `https://portal.qwen.ai/v1`
-- `portal.qwen.ai` is normalized to `/v1`, not `/compatible-mode/v1`
-- DashScope hosts still normalize to `/compatible-mode/v1`
-- only the expected Qwen OAuth model aliases are registered
+## Development
+
+```bash
+npm run check    # Run tests
+npm run prepack  # Run tests before publish
+```
 
 ## References
 
-Implementation is based on the current public docs and open-source integrations:
+- [Qwen Code auth docs](https://qwenlm.github.io/qwen-code-docs/en/users/configuration/auth/)
+- [Alibaba Cloud OpenAI-compatible API](https://www.alibabacloud.com/help/en/model-studio/compatibility-of-openai-with-dashscope)
+- [Qwen Code OAuth source](https://github.com/QwenLM/qwen-code/blob/main/packages/core/src/qwen/qwenOAuth2.ts)
 
-- Qwen Code authentication docs: `https://qwenlm.github.io/qwen-code-docs/en/users/configuration/auth/`
-- Alibaba Cloud OpenAI-compatible docs: `https://www.alibabacloud.com/help/en/model-studio/compatibility-of-openai-with-dashscope`
-- Qwen Code OAuth implementation: `https://github.com/QwenLM/qwen-code/blob/main/packages/core/src/qwen/qwenOAuth2.ts`
-- Qwen Code current OAuth model aliases: `https://github.com/QwenLM/qwen-code/blob/main/packages/core/src/models/constants.ts`
-- Qwen Code discussion of OAuth-backed models: `https://github.com/QwenLM/qwen-code/issues/702`
-- Similar open-source OAuth integrations using Qwen Portal: `https://cdn.jsdelivr.net/npm/openclaw@2026.1.29/extensions/qwen-portal-auth/index.ts`
+## License
 
-## Package notes
-
-- pi loads TypeScript extensions directly, so there is no separate build artifact.
-- Runtime dependencies on pi packages are declared as peer dependencies, per pi package guidance.
-- `prepack` runs the test suite so `npm pack` and `npm publish` fail fast on regressions.
+[MIT](https://github.com/RimuruW/pi-qwen-oauth/blob/main/LICENSE)

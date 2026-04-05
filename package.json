@@ -1,14 +1,18 @@
 {
-  "name": "pi-extension-qwen-oauth-models",
-  "version": "0.1.1",
+  "name": "pi-qwen-oauth",
+  "version": "0.1.2",
   "description": "Qwen OAuth provider for pi using the Qwen Portal OpenAI-compatible API.",
   "type": "module",
-  "keywords": [
-    "pi-package",
-    "pi-extension",
-    "qwen",
-    "oauth"
-  ],
+  "author": "RimuruW",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RimuruW/pi-qwen-oauth.git"
+  },
+  "bugs": {
+    "url": "https://github.com/RimuruW/pi-qwen-oauth/issues"
+  },
+  "homepage": "https://github.com/RimuruW/pi-qwen-oauth#readme",
   "files": [
     "index.ts",
     "README.md"

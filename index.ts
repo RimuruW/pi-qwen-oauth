@@ -4,10 +4,10 @@
  * Registers Qwen OAuth device login and the current Qwen OAuth model aliases
  * exposed through the Qwen Portal OpenAI-compatible chat completions API.
  *
- * The Qwen Portal API only supports `enable_thinking: true/false` (boolean),
- * not `thinking_budget`. pi-ai's `thinkingFormat: "qwen"` maps the TUI
- * reasoning effort selector to this boolean, so thinking can be toggled on/off
- * but effort granularity is not supported by the Qwen Portal API.
+ * The Qwen Portal API only supports `enable_thinking: true/false` (boolean).
+ * It does NOT support `thinking_budget` — effort granularity is not available.
+ * pi-ai's `thinkingFormat: "qwen"` maps the TUI effort selector to this boolean
+ * (off → false, any effort level → true), so thinking can be toggled on/off.
  */
 
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@mariozechner/pi-ai";
