@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import registerQwenOAuthProvider from "../index.ts";
+import registerQwenOAuthProvider, { refreshQwenToken, loginQwen } from "../index.ts";
+import type { OAuthCredentials } from "@mariozechner/pi-ai";
 
 type ProviderRegistration = {
 	name: string;
@@ -92,8 +93,8 @@ test("adds the Qwen Portal headers required for OAuth chat completions", () => {
 
 	assert.deepEqual(registration.config.headers, {
 		"X-DashScope-AuthType": "qwen-oauth",
-		"X-DashScope-UserAgent": "QwenCode/0.13.2 (darwin; arm64)",
-		"User-Agent": "QwenCode/0.13.2 (darwin; arm64)",
+		"X-DashScope-UserAgent": "QwenCode/0.14.0 (darwin; arm64)",
+		"User-Agent": "QwenCode/0.14.0 (darwin; arm64)",
 	});
 });
 
@@ -158,5 +159,288 @@ test("uses thinkingFormat qwen to map effort to enable_thinking boolean", () => 
 
 	for (const model of registration.config.models) {
 		assert.equal(model.compat?.thinkingFormat, "qwen", `model ${model.id} should use thinkingFormat "qwen"`);
+	}
+});
+
+// ---------------------------------------------------------------------------
+// Token refresh tests
+// ---------------------------------------------------------------------------
+
+const QWEN_TOKEN_ENDPOINT = "https://chat.qwen.ai/api/v1/oauth2/token";
+
+const mockFetch = (response: { ok: boolean; status?: number; json: () => Promise<unknown>; text?: () => Promise<string> }) => {
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url: RequestInfo | URL, init?: RequestInit) => {
+		// Assert the request targets the correct endpoint
+		assert.equal(url.toString(), QWEN_TOKEN_ENDPOINT);
+		assert.equal((init as RequestInit).method, "POST");
+
+		// Assert the request body contains refresh_token grant
+		const body = (init as RequestInit).body as string;
+		const params = new URLSearchParams(body);
+		assert.equal(params.get("grant_type"), "refresh_token");
+		assert.equal(params.get("client_id"), "f0304373b74a44d2b584a3fb70ca9e56");
+
+		return {
+			ok: response.ok,
+			status: response.status ?? 200,
+			json: response.json,
+			text: response.text ?? (async () => ""),
+		} as Response;
+	};
+	return () => {
+		globalThis.fetch = originalFetch;
+	};
+};
+
+test("refreshQwenToken returns new access_token and new refresh_token", async () => {
+	const restore = mockFetch({
+		ok: true,
+		json: async () => ({
+			access_token: "new-access",
+			refresh_token: "new-refresh",
+			token_type: "Bearer",
+			expires_in: 3600,
+		}),
+	});
+
+	const result = await refreshQwenToken({
+		access: "old-access",
+		refresh: "old-refresh",
+		expires: Date.now() - 1000,
+	});
+
+	restore();
+
+	assert.equal(result.access, "new-access");
+	assert.equal(result.refresh, "new-refresh");
+	// expires should be ~3600s from now, minus 5min buffer (3300s)
+	const delta = result.expires - Date.now();
+	assert.ok(delta > 3290 * 1000 && delta < 3301 * 1000, `expiry delta ${delta}ms should be ~3300000ms`);
+});
+
+test("refreshQwenToken preserves old refresh_token when response has none", async () => {
+	const restore = mockFetch({
+		ok: true,
+		json: async () => ({
+			access_token: "new-access",
+			token_type: "Bearer",
+			expires_in: 3600,
+		}),
+	});
+
+	const result = await refreshQwenToken({
+		access: "old-access",
+		refresh: "keep-me",
+		expires: Date.now() - 1000,
+	});
+
+	restore();
+
+	assert.equal(result.access, "new-access");
+	assert.equal(result.refresh, "keep-me");
+});
+
+test("refreshQwenToken throws when refresh token is missing", async () => {
+	await assert.rejects(
+		refreshQwenToken({
+			access: "some-access",
+			refresh: "",
+			expires: Date.now() - 1000,
+		}),
+		(err: unknown) => {
+			assert.ok(err instanceof Error);
+			assert.ok((err as Error).message.includes("refresh token is missing"));
+			return true;
+		},
+	);
+});
+
+test("refreshQwenToken throws on HTTP error response", async () => {
+	const restore = mockFetch({
+		ok: false,
+		status: 401,
+		json: async () => ({ error: "invalid_grant" }),
+		text: async () => '{"error":"invalid_grant"}',
+	});
+
+	await assert.rejects(
+		refreshQwenToken({
+			access: "old-access",
+			refresh: "old-refresh",
+			expires: Date.now() - 1000,
+		}),
+		(err: unknown) => {
+			assert.ok(err instanceof Error);
+			assert.ok((err as Error).message.includes("401"));
+			assert.ok((err as Error).message.includes("token refresh failed"));
+			return true;
+		},
+	);
+
+	restore();
+});
+
+test("refreshQwenToken throws when access_token is missing from response", async () => {
+	const restore = mockFetch({
+		ok: true,
+		json: async () => ({
+			refresh_token: "some-refresh",
+			token_type: "Bearer",
+			expires_in: 3600,
+		}),
+	});
+
+	await assert.rejects(
+		refreshQwenToken({
+			access: "old-access",
+			refresh: "old-refresh",
+			expires: Date.now() - 1000,
+		}),
+		(err: unknown) => {
+			assert.ok(err instanceof Error);
+			assert.ok((err as Error).message.includes("did not include an access token"));
+			return true;
+		},
+	);
+
+	restore();
+});
+
+// ---------------------------------------------------------------------------
+// Login flow tests
+// ---------------------------------------------------------------------------
+
+const QWEN_DEVICE_CODE_ENDPOINT = "https://chat.qwen.ai/api/v1/oauth2/device/code";
+
+const mockDeviceFlowFetch = (
+	deviceCodeResponse: () => Promise<unknown>,
+	tokenResponses: Array<{ ok: boolean; json: () => Promise<unknown> }>,
+) => {
+	const originalFetch = globalThis.fetch;
+	let callIndex = 0;
+	globalThis.fetch = async (url: RequestInfo | URL, init?: RequestInit) => {
+		const urlString = url.toString();
+		if (urlString === QWEN_DEVICE_CODE_ENDPOINT) {
+			return {
+				ok: true,
+				status: 200,
+				json: deviceCodeResponse,
+				signal: (init as RequestInit)?.signal,
+			} as unknown as Response;
+		}
+		if (urlString === QWEN_TOKEN_ENDPOINT) {
+			const response = tokenResponses[callIndex++] || tokenResponses[tokenResponses.length - 1];
+			return {
+				ok: response.ok,
+				status: 200,
+				json: response.json,
+			} as Response;
+		}
+		throw new Error(`Unexpected fetch URL: ${urlString}`);
+	};
+	return () => {
+		globalThis.fetch = originalFetch;
+	};
+};
+
+test("loginQwen throws immediately when signal is already aborted", async () => {
+	const controller = new AbortController();
+	controller.abort();
+
+	await assert.rejects(
+		loginQwen({
+			onAuth: () => {},
+			onPrompt: async () => "",
+			signal: controller.signal,
+		}),
+		(err: unknown) => {
+			assert.ok(err instanceof Error);
+			assert.ok((err as Error).message.includes("login cancelled"));
+			return true;
+		},
+	);
+});
+
+test("loginQwen passes signal to device code fetch", async () => {
+	const controller = new AbortController();
+	let capturedSignal: AbortSignal | undefined;
+
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async (url: RequestInfo | URL, init?: RequestInit) => {
+		if (url.toString() === QWEN_DEVICE_CODE_ENDPOINT) {
+			capturedSignal = (init as RequestInit)?.signal as AbortSignal | undefined;
+		}
+		throw new Error("abort early");
+	};
+
+	await assert.rejects(
+		loginQwen({
+			onAuth: () => {},
+			onPrompt: async () => "",
+			signal: controller.signal,
+		}),
+	);
+
+	globalThis.fetch = originalFetch;
+
+	assert.ok(capturedSignal === controller.signal, "signal should be passed to device code fetch");
+});
+
+test("loginQwen calls onProgress during long poll", async () => {
+	const progressMessages: string[] = [];
+
+	// Speed up polls by making setTimeout resolve instantly
+	const originalSetTimeout = globalThis.setTimeout;
+	globalThis.setTimeout = ((cb: (...args: unknown[]) => void) => {
+		queueMicrotask(() => cb());
+		return 0 as unknown as ReturnType<typeof setTimeout>;
+	}) as typeof setTimeout;
+
+	const restore = mockDeviceFlowFetch(
+		async () => ({
+			device_code: "dev-123",
+			user_code: "ABCD",
+			verification_uri: "https://example.com/auth",
+			expires_in: 60,
+			interval: 0,
+		}),
+		[
+			// 9x authorization_pending (no progress)
+			...Array(9).fill({
+				ok: false,
+				json: async () => ({ error: "authorization_pending" }),
+			}),
+			// 10th poll triggers onProgress
+			{
+				ok: false,
+				json: async () => ({ error: "authorization_pending" }),
+			},
+			// Success on 11th
+			{
+				ok: true,
+				json: async () => ({
+					access_token: "tok",
+					refresh_token: "ref",
+					token_type: "Bearer",
+					expires_in: 3600,
+				}),
+			},
+		],
+	);
+
+	try {
+		const result = await loginQwen({
+			onAuth: () => {},
+			onPrompt: async () => "",
+			onProgress: (msg) => progressMessages.push(msg),
+		});
+
+		assert.deepEqual(progressMessages, ["Waiting for browser authorization…"]);
+		assert.equal(result.access, "tok");
+		assert.equal(result.refresh, "ref");
+	} finally {
+		restore();
+		globalThis.setTimeout = originalSetTimeout;
 	}
 });

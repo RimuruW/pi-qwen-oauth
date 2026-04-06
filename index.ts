@@ -21,7 +21,7 @@ const QWEN_DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code";
 const QWEN_DEFAULT_BASE_URL = "https://portal.qwen.ai/v1";
 const QWEN_DEFAULT_POLL_INTERVAL_MS = 2000;
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
-const QWEN_PORTAL_USER_AGENT = "QwenCode/0.13.2 (darwin; arm64)";
+const QWEN_PORTAL_USER_AGENT = "QwenCode/0.14.0 (darwin; arm64)";
 
 interface DeviceCodeResponse {
 	device_code: string;
@@ -162,7 +162,7 @@ function computeExpiry(expiresInSeconds: number): number {
 	return Date.now() + expiresInSeconds * 1000 - FIVE_MINUTES_MS;
 }
 
-async function startDeviceFlow(): Promise<{ device: DeviceCodeResponse; verifier: string }> {
+async function startDeviceFlow(signal?: AbortSignal): Promise<{ device: DeviceCodeResponse; verifier: string }> {
 	const { verifier, challenge } = await generatePkce();
 
 	const response = await fetch(QWEN_DEVICE_CODE_ENDPOINT, {
@@ -178,6 +178,7 @@ async function startDeviceFlow(): Promise<{ device: DeviceCodeResponse; verifier
 			code_challenge: challenge,
 			code_challenge_method: "S256",
 		}).toString(),
+		signal,
 	});
 
 	if (!response.ok) {
@@ -217,13 +218,20 @@ async function pollForToken(
 	intervalSeconds: number | undefined,
 	expiresIn: number,
 	signal?: AbortSignal,
+	onProgress?: (message: string) => void,
 ): Promise<TokenResponse> {
 	const deadline = Date.now() + expiresIn * 1000;
 	let intervalMs = Math.max(1000, Math.floor((intervalSeconds ?? QWEN_DEFAULT_POLL_INTERVAL_MS / 1000) * 1000));
+	let pollCount = 0;
 
 	while (Date.now() < deadline) {
 		if (signal?.aborted) {
 			throw new Error("Qwen login cancelled");
+		}
+
+		pollCount++;
+		if (onProgress && pollCount % 10 === 0) {
+			onProgress("Waiting for browser authorization…");
 		}
 
 		const response = await fetch(QWEN_TOKEN_ENDPOINT, {
@@ -273,14 +281,25 @@ async function pollForToken(
 	throw new Error("Qwen login timed out");
 }
 
-async function loginQwen(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-	const { device, verifier } = await startDeviceFlow();
+export async function loginQwen(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
+	if (callbacks.signal?.aborted) {
+		throw new Error("Qwen login cancelled");
+	}
+
+	const { device, verifier } = await startDeviceFlow(callbacks.signal);
 	const authUrl = device.verification_uri_complete || device.verification_uri;
 	const instructions = device.verification_uri_complete ? undefined : `Enter code: ${device.user_code}`;
 
 	callbacks.onAuth({ url: authUrl, instructions });
 
-	const token = await pollForToken(device.device_code, verifier, device.interval, device.expires_in, callbacks.signal);
+	const token = await pollForToken(
+		device.device_code,
+		verifier,
+		device.interval,
+		device.expires_in,
+		callbacks.signal,
+		callbacks.onProgress,
+	);
 	return {
 		refresh: token.refresh_token || "",
 		access: token.access_token,
@@ -289,7 +308,7 @@ async function loginQwen(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentia
 	};
 }
 
-async function refreshQwenToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+export async function refreshQwenToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
 	if (!credentials.refresh) {
 		throw new Error("Qwen OAuth refresh token is missing; run /login qwen-oauth again");
 	}
