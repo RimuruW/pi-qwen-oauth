@@ -6,7 +6,7 @@
 
 Qwen OAuth provider for [pi](https://github.com/badlogic/pi-mono). Log in with your qwen.ai account and use Qwen models via the Qwen Portal OpenAI-compatible API.
 
-> [Qwen](https://qwenlm.github.io/) is a powerful family of large language models developed by Alibaba Cloud's Tongyi Lab, excelling in reasoning, coding, and multilingual tasks. This project was built with the assistance of Qwen 3.6 Plus — most of the implementation and documentation were authored by the model itself.
+> [Qwen](https://qwen.ai/research) is a powerful family of large language models developed by Alibaba Cloud's Tongyi Lab, excelling in reasoning, coding, and multilingual tasks. This project was built with the assistance of Qwen 3.6 Plus — most of the implementation and documentation were authored by the model itself.
 
 ## Features
 
@@ -15,7 +15,6 @@ Qwen OAuth provider for [pi](https://github.com/badlogic/pi-mono). Log in with y
 - **Correct endpoint routing** — OAuth sessions route to `https://portal.qwen.ai/v1`, DashScope hosts fall back to `/compatible-mode/v1`
 - **Request normalization** — system messages formatted as Qwen Portal-compatible content parts
 - **Thinking mode** — toggle thinking on/off via the TUI reasoning selector (Qwen Portal API supports `enable_thinking` as a boolean)
-- **Model aliases** aligned with the official [Qwen Code](https://github.com/QwenLM/qwen-code) OAuth integration
 
 ## Quick Start
 
@@ -48,13 +47,10 @@ pi install .
 | Alias | Input | Context | Max Tokens | Reasoning |
 |---|---|---|---|---|
 | `qwen-oauth/coder-model` | text | 1M | 65,536 | ✅ |
-| `qwen-oauth/vision-model` | text, image | 262K | 32,768 | ✅ |
-
-These aliases track the models currently available through Qwen OAuth accounts. They do not cover the full DashScope model catalog — only what the OAuth token grants access to.
 
 ## Thinking Mode
 
-Both models have reasoning enabled. The pi TUI displays a thinking effort selector (off / minimal / low / medium / high). The Qwen Portal API only accepts `enable_thinking` as a boolean:
+The model has reasoning enabled. The pi TUI displays a thinking effort selector (off / minimal / low / medium / high). The Qwen Portal API only accepts `enable_thinking` as a boolean:
 
 | TUI Selection | API Parameter |
 |---|---|

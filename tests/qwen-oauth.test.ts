@@ -47,12 +47,12 @@ test("registers Qwen OAuth against the Qwen portal endpoint by default", () => {
 	assert.equal(registration.config.baseUrl, "https://portal.qwen.ai/v1");
 });
 
-test("registers only the Qwen OAuth aliases that current Qwen Code integrations expose", () => {
+test("registers only the coder-model", () => {
 	const { registration } = registerExtension();
 
 	assert.deepEqual(
 		registration.config.models.map((model) => model.id),
-		["coder-model", "vision-model"],
+		["coder-model"],
 	);
 });
 
@@ -126,7 +126,7 @@ test("converts existing system string content into Qwen Portal content parts", (
 
 	const normalized = beforeProviderRequest({
 		payload: {
-			model: "vision-model",
+			model: "coder-model",
 			messages: [
 				{ role: "system", content: "You are helpful." },
 				{ role: "user", content: "describe the image" },

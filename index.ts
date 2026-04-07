@@ -68,14 +68,6 @@ const MODELS: QwenModelConfig[] = [
 		contextWindow: 1000000,
 		maxTokens: 65536,
 	},
-	{
-		id: "vision-model",
-		name: "Qwen Vision",
-		reasoning: true,
-		input: ["text", "image"],
-		contextWindow: 262144,
-		maxTokens: 32768,
-	},
 ];
 
 async function generatePkce(): Promise<{ verifier: string; challenge: string }> {
