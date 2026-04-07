@@ -74,6 +74,8 @@ A common mistake is authenticating with Qwen OAuth but sending requests to DashS
 
 ```
 ├── index.ts                  # Extension entry point — provider registration & OAuth flow
+├── docs/
+│   └── multi-profile.md      # Multi-profile mode documentation (dev/research only)
 ├── tests/
 │   └── qwen-oauth.test.ts    # Provider & normalization tests
 ├── package.json
@@ -88,6 +90,10 @@ No build step — pi loads TypeScript extensions directly via `node --experiment
 npm run check    # Run tests
 npm run prepack  # Run tests before publish
 ```
+
+### Multi-Profile Mode
+
+An opt-in feature for managing multiple Qwen OAuth accounts. Set `PI_QWEN_OAUTH_PROFILES=true` to enable. See [docs/multi-profile.md](docs/multi-profile.md) for details.
 
 ## References
 
