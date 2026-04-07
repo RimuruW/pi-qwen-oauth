@@ -17,6 +17,7 @@
 import { createAssistantMessageEventStream } from "@mariozechner/pi-ai";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -246,6 +247,45 @@ function migrateOldCredentials(store: ProfileStoreData): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Migration: profile mode -> normal mode (env var removed)
+// ---------------------------------------------------------------------------
+
+function migrateProfileToAuth(): boolean {
+	const store = loadProfileStore();
+	const active = getActiveProfile(store);
+	if (!active) return false;
+
+	const cred = getCredential(store, active.key);
+	if (!cred || !cred.access || !cred.refresh) return false;
+
+	const authPath = path.join(os.homedir(), ".pi", "agent", "auth.json");
+	const authData: Record<string, unknown> = fs.existsSync(authPath)
+		? JSON.parse(fs.readFileSync(authPath, "utf-8"))
+		: {};
+
+	// Skip if auth.json already has the same credentials (no-op migration)
+	const existing = authData["qwen-oauth"];
+	if (existing && typeof existing === "object" && (existing as Record<string, unknown>).access === cred.access) {
+		return false;
+	}
+
+	authData["qwen-oauth"] = {
+		type: "oauth",
+		access: cred.access,
+		refresh: cred.refresh,
+		expires: cred.expires,
+		enterpriseUrl: cred.enterpriseUrl,
+	};
+
+	const dir = path.dirname(authPath);
+	if (!fs.existsSync(dir)) {
+		fs.mkdirSync(dir, { recursive: true });
+	}
+	fs.writeFileSync(authPath, JSON.stringify(authData, null, 2), "utf-8");
+	return true;
+}
+
+// ---------------------------------------------------------------------------
 // PKCE helpers
 // ---------------------------------------------------------------------------
 
@@ -270,6 +310,39 @@ function toBase64Url(bytes: Uint8Array): string {
 // ---------------------------------------------------------------------------
 // Base URL normalization
 // ---------------------------------------------------------------------------
+
+function openBrowser(url: string): void {
+	const openCmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+	// Use execFile to avoid shell injection; on Windows cmd needs /c prefix
+	const args = openCmd === "cmd" ? ["/c", "start", url] : [url];
+	execFile(openCmd, args);
+}
+
+// ---------------------------------------------------------------------------
+// Interactive login helper (shared across commands and TUI panel)
+// ---------------------------------------------------------------------------
+
+async function interactiveLogin(
+	store: ProfileStoreData,
+	profileKey: string,
+	label: string,
+	ctx: ExtensionContext,
+): Promise<void> {
+	ctx.ui.notify(`Starting login for ${label}…`, "info");
+	try {
+		await loginProfile(store, profileKey, {
+			onAuth: ({ url }) => {
+				openBrowser(url);
+				ctx.ui.notify(`Opened browser. If login didn't complete, visit: ${url}`, "info");
+			},
+			onPrompt: async ({ message }) => (await ctx.ui.input(message)) || "",
+			signal: ctx.signal,
+		});
+		ctx.ui.notify(`Logged in to ${label}`, "info");
+	} catch (error) {
+		ctx.ui.notify(`Login failed for ${label}: ${error instanceof Error ? error.message : String(error)}`, "error");
+	}
+}
 
 function normalizeBaseUrl(resourceUrl?: string): string {
 	if (!resourceUrl) {
@@ -651,16 +724,14 @@ function buildOpenAIMessages(context: { messages: Array<{ role: string; content:
 				content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content),
 			});
 		} else if (msg.role === "assistant") {
-			const content: Array<Record<string, unknown>> = [];
+			const textParts: string[] = [];
 			const toolCalls: Array<Record<string, unknown>> = [];
 			if (Array.isArray(msg.content)) {
 				for (const block of msg.content) {
 					if (block && typeof block === "object") {
 						const b = block as Record<string, unknown>;
-						if (b.type === "text" && typeof b.text === "string") {
-							content.push({ type: "text", text: b.text });
-						} else if (b.type === "thinking" && typeof b.thinking === "string") {
-							content.push({ type: "thinking", text: b.thinking });
+						if (b.type === "text" && typeof b.text === "string" && b.text.trim().length > 0) {
+							textParts.push(b.text);
 						} else if (b.type === "toolCall") {
 							toolCalls.push({
 								id: (b.id as string) || "",
@@ -675,8 +746,11 @@ function buildOpenAIMessages(context: { messages: Array<{ role: string; content:
 				}
 			}
 			const assistantMsg: Record<string, unknown> = { role: "assistant" };
-			if (content.length > 0) assistantMsg.content = content;
+			// OpenAI Chat Completions standard: assistant content is a plain string
+			if (textParts.length > 0) assistantMsg.content = textParts.join("");
 			if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
+			// Skip assistant messages with no content and no tool calls
+			if (assistantMsg.content === undefined && !assistantMsg.tool_calls) continue;
 			messages.push(assistantMsg);
 		} else {
 			// user or system
@@ -699,7 +773,7 @@ function buildRequestPayload(
 	// If there's a systemPrompt and no system message in the conversation, prepend it
 	const hasSystem = messages.some((m) => m.role === "system");
 	if (context.systemPrompt && !hasSystem) {
-		messages.unshift({ role: "system", content: [{ type: "text", text: context.systemPrompt }] });
+		messages.unshift({ role: "system", content: context.systemPrompt });
 	}
 
 	const payload: Record<string, unknown> = {
@@ -1075,17 +1149,9 @@ function registerProfileCommand(pi: ExtensionAPI, store: ProfileStoreData): void
 					return;
 				}
 				try {
-					ctx.ui.notify(`Starting login for ${profile.label}… Check your browser.`, "info");
-					await loginProfile(store, key, {
-						onAuth: ({ url }) => {
-							ctx.ui.notify(`Please open this URL to login: ${url}`, "info");
-						},
-						onPrompt: async ({ message }) => (await ctx.ui.input(message)) || "",
-						signal: ctx.signal,
-					});
-					ctx.ui.notify(`Logged in to ${profile.label}`, "info");
-				} catch (error) {
-					ctx.ui.notify(`Login failed for ${profile.label}: ${error instanceof Error ? error.message : String(error)}`, "error");
+					await interactiveLogin(store, key, profile.label, ctx);
+				} catch {
+					// Error already handled by interactiveLogin
 				}
 				return;
 			}
@@ -1095,6 +1161,11 @@ function registerProfileCommand(pi: ExtensionAPI, store: ProfileStoreData): void
 				const label = parts.slice(2).join(" ") || key;
 				if (addProfile(store, key, label)) {
 					ctx.ui.notify(`Added profile: ${label} (${key})`, "info");
+					// Prompt to login
+					const doLogin = await ctx.ui.confirm(`Login to ${label} now?`);
+					if (doLogin) {
+						await interactiveLogin(store, key, label, ctx);
+					}
 				} else {
 					ctx.ui.notify(`Profile "${key}" already exists`, "warning");
 				}
@@ -1147,8 +1218,31 @@ async function openProfilePanel(ctx: ExtensionContext, store: ProfileStoreData):
 			return `${p.label}${activeMarker}  [${p.key}]  ${status}`;
 		});
 
-		const selected = await ctx.ui.select("Qwen OAuth Profiles", options);
+		const menuOptions = [...options, "───", "Add new profile"];
+		const selected = await ctx.ui.select("Qwen OAuth Profiles", menuOptions);
 		if (!selected) return;
+
+		// Check if user selected "Add new profile"
+		if (selected === "Add new profile") {
+			const key = await ctx.ui.input("Profile key (e.g. work, personal):");
+			if (!key?.trim()) continue;
+			if (getProfile(store, key.trim())) {
+				ctx.ui.notify(`Profile "${key.trim()}" already exists`, "warning");
+				continue;
+			}
+			const label = await ctx.ui.input("Display label:", key.trim());
+			addProfile(store, key.trim(), label?.trim() || key.trim());
+			ctx.ui.notify(`Added profile: ${label?.trim() || key.trim()} (${key.trim()})`, "info");
+			// Prompt to login
+			const doLogin = await ctx.ui.confirm(`Login to ${label?.trim() || key.trim()} now?`);
+			if (doLogin) {
+				await interactiveLogin(store, key.trim(), label?.trim() || key.trim(), ctx);
+			}
+			continue;
+		}
+
+		// Skip separator
+		if (selected === "───") continue;
 
 		// Find which profile was selected (match by key in the display)
 		const selectedIndex = options.indexOf(selected);
@@ -1173,19 +1267,7 @@ async function openProfilePanel(ctx: ExtensionContext, store: ProfileStoreData):
 		}
 
 		if (action.includes("Refresh") || action.includes("Login")) {
-			try {
-				ctx.ui.notify(`Starting login for ${profile.label}… Check your browser.`, "info");
-				await loginProfile(store, profile.key, {
-					onAuth: ({ url }) => {
-						ctx.ui.notify(`Please open this URL to login: ${url}`, "info");
-					},
-					onPrompt: async ({ message }) => (await ctx.ui.input(message)) || "",
-					signal: ctx.signal,
-				});
-				ctx.ui.notify(`Logged in to ${profile.label}`, "info");
-			} catch (error) {
-				ctx.ui.notify(`Login failed for ${profile.label}: ${error instanceof Error ? error.message : String(error)}`, "error");
-			}
+			await interactiveLogin(store, profile.key, profile.label, ctx);
 			continue;
 		}
 
@@ -1232,6 +1314,15 @@ export default function registerQwenOAuthProvider(pi: ExtensionAPI) {
 // ---------------------------------------------------------------------------
 
 function registerNormalMode(pi: ExtensionAPI): void {
+	// Migrate active profile credentials from profile store to auth.json
+	const migrated = migrateProfileToAuth();
+
+	if (migrated) {
+		pi.on("session_start", async (_event, ctx) => {
+			ctx.ui.notify("Migrated active Qwen OAuth profile credentials to normal mode.", "info");
+		});
+	}
+
 	pi.registerProvider("qwen-oauth", {
 		baseUrl: QWEN_DEFAULT_BASE_URL,
 		apiKey: "QWEN_OAUTH_API_KEY",
