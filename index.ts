@@ -752,11 +752,30 @@ function buildOpenAIMessages(context: { messages: Array<{ role: string; content:
 			// Skip assistant messages with no content and no tool calls
 			if (assistantMsg.content === undefined && !assistantMsg.tool_calls) continue;
 			messages.push(assistantMsg);
-		} else {
-			// user or system
+		} else if (msg.role === "system") {
+			// System messages: normalize content to content-parts array
 			messages.push({
-				role: msg.role === "system" ? "system" : "user",
-				content: msg.content,
+				role: "system",
+				content: normalizeQwenSystemContent(msg.content),
+			});
+		} else {
+			// user: collapse content-parts array to plain string
+			let userContent = msg.content;
+			if (Array.isArray(userContent)) {
+				const texts: string[] = [];
+				for (const part of userContent) {
+					if (part && typeof part === "object") {
+						const p = part as Record<string, unknown>;
+						if (p.type === "text" && typeof p.text === "string") {
+							texts.push(p.text);
+						}
+					}
+				}
+				userContent = texts.join("");
+			}
+			messages.push({
+				role: "user",
+				content: userContent,
 			});
 		}
 	}
@@ -823,7 +842,8 @@ function createQwenStream(
 
 	(async () => {
 		try {
-			const payload = buildRequestPayload(modelId, context, options);
+			const rawPayload = buildRequestPayload(modelId, context, options);
+			const payload = normalizeQwenPortalPayload(rawPayload) as Record<string, unknown>;
 
 			const requestHeaders: Record<string, string> = {
 				"Content-Type": "application/json",
