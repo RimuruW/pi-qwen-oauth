@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.0] — 2026-04-08
+
+### Features
+- add multi-profile OAuth account management (`/qwen-profile` command and TUI panel)
+
+### Bug Fixes
+- fix 400 error in multi-profile mode and improve TUI UX
+- normalize messages in profiles-mode streamSimple
+- handle expired token migration — show warning instead of misleading "Imported" notification
+- fix `ctx.ui.confirm` missing message argument that rendered "undefined" in dialog
+
+### Refactor
+- improve auth.json sync and profile mode architecture
+
+### Other
+- remove vision-model from registered models
+
 ## [0.1.3] — 2026-04-06
 
 ### Features

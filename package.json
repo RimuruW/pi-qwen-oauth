@@ -1,6 +1,6 @@
 {
   "name": "pi-qwen-oauth",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "Qwen OAuth provider for pi using the Qwen Portal OpenAI-compatible API.",
   "type": "module",
   "author": "RimuruW",
