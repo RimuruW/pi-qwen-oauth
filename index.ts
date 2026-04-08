@@ -214,27 +214,29 @@ function renameProfileLabel(store: ProfileStoreData, key: string, label: string)
 // Migration: import old auth.json credentials into default profile
 // ---------------------------------------------------------------------------
 
-function migrateOldCredentials(store: ProfileStoreData): boolean {
+function migrateOldCredentials(store: ProfileStoreData): { migrated: boolean; loggedIn: boolean } {
 	// Only migrate if default profile has no credentials yet
 	if (isProfileLoggedIn(store, "default") || store.credentials["default"]?.refresh) {
-		return false;
+		return { migrated: false, loggedIn: false };
 	}
 
 	// Try to read pi's auth.json
 	const authPath = path.join(os.homedir(), ".pi", "agent", "auth.json");
 	try {
-		if (!fs.existsSync(authPath)) return false;
+		if (!fs.existsSync(authPath)) return { migrated: false, loggedIn: false };
 		const text = fs.readFileSync(authPath, "utf-8");
 		const auth = JSON.parse(text) as Record<string, unknown>;
 		const qwenCred = auth["qwen-oauth"];
 		if (!qwenCred || typeof qwenCred !== "object" || (qwenCred as Record<string, unknown>).type !== "oauth") {
-			return false;
+			return { migrated: false, loggedIn: false };
 		}
 		const oauth = qwenCred as Record<string, unknown>;
 		const access = oauth.access as string | undefined;
 		const refresh = oauth.refresh as string | undefined;
 		const expires = oauth.expires as number | undefined;
-		if (!access || !refresh || !expires) return false;
+		if (!access || !refresh || !expires) return { migrated: false, loggedIn: false };
+
+		const loggedIn = Date.now() < expires;
 
 		store.credentials["default"] = {
 			access,
@@ -243,9 +245,9 @@ function migrateOldCredentials(store: ProfileStoreData): boolean {
 			enterpriseUrl: oauth.enterpriseUrl as string | undefined,
 		};
 		saveProfileStore(store);
-		return true;
+		return { migrated: true, loggedIn };
 	} catch {
-		return false;
+		return { migrated: false, loggedIn: false };
 	}
 }
 
@@ -1226,7 +1228,7 @@ function registerProfileCommand(pi: ExtensionAPI, store: ProfileStoreData): void
 				if (addProfile(store, key, label)) {
 					ctx.ui.notify(`Added profile: ${label} (${key})`, "info");
 					// Prompt to login
-					const doLogin = await ctx.ui.confirm(`Login to ${label} now?`);
+					const doLogin = await ctx.ui.confirm(`Login to ${label}`, `Start the OAuth device flow for ${label}?`);
 					if (doLogin) {
 						await interactiveLogin(store, key, label, ctx);
 					}
@@ -1298,7 +1300,8 @@ async function openProfilePanel(ctx: ExtensionContext, store: ProfileStoreData):
 			addProfile(store, key.trim(), label?.trim() || key.trim());
 			ctx.ui.notify(`Added profile: ${label?.trim() || key.trim()} (${key.trim()})`, "info");
 			// Prompt to login
-			const doLogin = await ctx.ui.confirm(`Login to ${label?.trim() || key.trim()} now?`);
+			const name = label?.trim() || key.trim();
+			const doLogin = await ctx.ui.confirm(`Login to ${name}`, `Start the OAuth device flow for ${name}?`);
 			if (doLogin) {
 				await interactiveLogin(store, key.trim(), label?.trim() || key.trim(), ctx);
 			}
@@ -1465,10 +1468,22 @@ function createProfileStreamSimple() {
 function updateProfileStatus(store: ProfileStoreData, ctx: ExtensionContext): void {
 	syncLogoutState(store);
 	const active = getActiveProfile(store);
-	const loggedIn = active ? isProfileLoggedIn(store, active.key) : false;
-	if (active) {
-		ctx.ui.setStatus("qwen-oauth-profiles", `Qwen: ${active.label}${loggedIn ? "" : " (not logged in)"}`);
+	if (!active) return;
+
+	const cred = getCredential(store, active.key);
+	let status: string;
+
+	if (!cred || !cred.access) {
+		status = `Qwen: ${active.label} (not logged in)`;
+	} else if (Date.now() < cred.expires) {
+		status = `Qwen: ${active.label}`;
+	} else if (cred.refresh) {
+		status = `Qwen: ${active.label} (token expired — will refresh on next request)`;
+	} else {
+		status = `Qwen: ${active.label} (not logged in)`;
 	}
+
+	ctx.ui.setStatus("qwen-oauth-profiles", status);
 }
 
 export default function registerQwenOAuthProvider(pi: ExtensionAPI) {
@@ -1542,7 +1557,7 @@ function registerNormalMode(pi: ExtensionAPI): void {
 
 function registerProfileMode(pi: ExtensionAPI): void {
 	const store = loadProfileStore();
-	const migrated = migrateOldCredentials(store);
+	const { migrated, loggedIn } = migrateOldCredentials(store);
 
 	// Sync active profile credentials to auth.json so framework sees "logged in"
 	syncCredentialToAuth(store);
@@ -1551,7 +1566,11 @@ function registerProfileMode(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		if (migrated) {
-			ctx.ui.notify("Imported existing Qwen OAuth login into profile \"Default\".", "info");
+			if (loggedIn) {
+				ctx.ui.notify("Imported existing Qwen OAuth login into profile \"Default\".", "info");
+			} else {
+				ctx.ui.notify("Found expired Qwen OAuth credentials in profile \"Default\" — please log in again.", "warning");
+			}
 		}
 		updateProfileStatus(store, ctx);
 	});
