@@ -176,6 +176,9 @@ function setActiveProfile(store: ProfileStoreData, key: string): boolean {
 	if (!getProfile(store, key)) return false;
 	store.activeProfile = key;
 	saveProfileStore(store);
+	if (PROFILES_ENABLED) {
+		syncCredentialToAuth(store);
+	}
 	return true;
 }
 
@@ -247,26 +250,51 @@ function migrateOldCredentials(store: ProfileStoreData): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Migration: profile mode -> normal mode (env var removed)
+// auth.json sync helpers (profile mode)
 // ---------------------------------------------------------------------------
 
-function migrateProfileToAuth(): boolean {
-	const store = loadProfileStore();
+function getAuthJsonPath(): string {
+	return path.join(os.homedir(), ".pi", "agent", "auth.json");
+}
+
+function readAuthJson(): Record<string, unknown> {
+	const authPath = getAuthJsonPath();
+	try {
+		if (fs.existsSync(authPath)) {
+			return JSON.parse(fs.readFileSync(authPath, "utf-8")) as Record<string, unknown>;
+		}
+	} catch {
+		// Fall through
+	}
+	return {};
+}
+
+function writeAuthJson(data: Record<string, unknown>): void {
+	const authPath = getAuthJsonPath();
+	const dir = path.dirname(authPath);
+	if (!fs.existsSync(dir)) {
+		fs.mkdirSync(dir, { recursive: true });
+	}
+	fs.writeFileSync(authPath, JSON.stringify(data, null, 2), "utf-8");
+}
+
+/**
+ * Sync active profile's credentials to auth.json so the framework sees
+ * qwen-oauth as "logged in" (hasAuth returns true, /login and /logout work).
+ */
+function syncCredentialToAuth(store: ProfileStoreData): void {
 	const active = getActiveProfile(store);
-	if (!active) return false;
+	if (!active) return;
 
 	const cred = getCredential(store, active.key);
-	if (!cred || !cred.access || !cred.refresh) return false;
+	if (!cred || !cred.access || !cred.refresh) return;
 
-	const authPath = path.join(os.homedir(), ".pi", "agent", "auth.json");
-	const authData: Record<string, unknown> = fs.existsSync(authPath)
-		? JSON.parse(fs.readFileSync(authPath, "utf-8"))
-		: {};
-
-	// Skip if auth.json already has the same credentials (no-op migration)
+	const authData = readAuthJson();
 	const existing = authData["qwen-oauth"];
+
+	// Skip if auth.json already has the same access token (no-op)
 	if (existing && typeof existing === "object" && (existing as Record<string, unknown>).access === cred.access) {
-		return false;
+		return;
 	}
 
 	authData["qwen-oauth"] = {
@@ -276,12 +304,28 @@ function migrateProfileToAuth(): boolean {
 		expires: cred.expires,
 		enterpriseUrl: cred.enterpriseUrl,
 	};
+	writeAuthJson(authData);
+}
 
-	const dir = path.dirname(authPath);
-	if (!fs.existsSync(dir)) {
-		fs.mkdirSync(dir, { recursive: true });
-	}
-	fs.writeFileSync(authPath, JSON.stringify(authData, null, 2), "utf-8");
+/**
+ * Detect if /logout qwen-oauth was called by checking whether auth.json
+ * no longer has a qwen-oauth entry while the vault still does.
+ * If so, clear the active profile's credentials from the vault.
+ * Returns true if a logout was detected and cleaned up.
+ */
+function syncLogoutState(store: ProfileStoreData): boolean {
+	const active = getActiveProfile(store);
+	if (!active) return false;
+
+	const cred = getCredential(store, active.key);
+	if (!cred) return false;
+
+	const authData = readAuthJson();
+	if (authData["qwen-oauth"]) return false;
+
+	// auth.json has no qwen-oauth entry, but vault does → logout detected
+	delete store.credentials[active.key];
+	saveProfileStore(store);
 	return true;
 }
 
@@ -1318,29 +1362,155 @@ async function openProfilePanel(ctx: ExtensionContext, store: ProfileStoreData):
 // Provider registration
 // ---------------------------------------------------------------------------
 
+/** Shared model definitions used by both normal and profile modes. */
+const PROVIDER_MODELS = MODELS.map((model) => ({
+	id: model.id,
+	name: model.name,
+	reasoning: model.reasoning,
+	input: model.input,
+	cost: ZERO_COST,
+	contextWindow: model.contextWindow,
+	maxTokens: model.maxTokens,
+	compat: {
+		supportsDeveloperRole: false,
+		maxTokensField: "max_tokens",
+		...(model.reasoning ? { thinkingFormat: "qwen" as const } : {}),
+	},
+}));
+
+/** Build a streamSimple error result for profile mode. */
+function buildStreamError(modelId: string, error: unknown) {
+	const errorMessage = error instanceof Error ? error.message : String(error);
+	return {
+		role: "assistant" as const,
+		content: [] as unknown[],
+		api: "openai-completions" as const,
+		provider: "qwen-oauth",
+		model: modelId,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: "error" as const,
+		errorMessage,
+		timestamp: Date.now(),
+	};
+}
+
+/** Profile-mode streamSimple: bypasses framework auth, uses vault directly. */
+function createProfileStreamSimple() {
+	return (model: { id: string; headers?: Record<string, string> }, context: { messages: Array<{ role: string; content: unknown }>; systemPrompt?: string }, options?: { temperature?: number; maxTokens?: number; reasoning?: string; signal?: AbortSignal }) => {
+		const currentStore = loadProfileStore();
+
+		// Detect if /logout was called since last request
+		syncLogoutState(currentStore);
+
+		const activeProfile = getActiveProfile(currentStore);
+		if (!activeProfile) {
+			throw new Error("No active Qwen OAuth profile configured.");
+		}
+
+		const tokenPromise = ensureValidProfileToken(currentStore, activeProfile.key);
+		const wrapper = createAssistantMessageEventStream();
+
+		tokenPromise.then((cred) => {
+			// After successful refresh, sync to auth.json so framework stays aware
+			syncCredentialToAuth(currentStore);
+
+			const baseUrl = cred.enterpriseUrl ? normalizeBaseUrl(cred.enterpriseUrl) : QWEN_DEFAULT_BASE_URL;
+
+			const adaptedContext = {
+				messages: context.messages.map((m) => ({
+					role: m.role,
+					content: m.content,
+					toolCallId: (m as Record<string, unknown>).toolCallId as string | undefined,
+					toolName: (m as Record<string, unknown>).toolName as string | undefined,
+				})),
+				systemPrompt: context.systemPrompt,
+			};
+
+			const realStream = createQwenStream(
+				model.id,
+				baseUrl,
+				model.headers,
+				adaptedContext,
+				cred.access,
+				{
+					temperature: options?.temperature,
+					maxTokens: options?.maxTokens,
+					reasoning: options?.reasoning,
+					signal: options?.signal,
+				},
+			);
+
+			(async () => {
+				try {
+					for await (const event of realStream) {
+						wrapper.push(event);
+					}
+					wrapper.end(await realStream.result());
+				} catch (error) {
+					const errResult = buildStreamError(model.id, error);
+					wrapper.push({ type: "error", reason: "error", error: errResult });
+					wrapper.end(errResult);
+				}
+			})();
+		}).catch((error) => {
+			const errResult = buildStreamError(model.id, error);
+			wrapper.push({ type: "error", reason: "error", error: errResult });
+			wrapper.end(errResult);
+		});
+
+		return wrapper;
+	};
+}
+
+function updateProfileStatus(store: ProfileStoreData, ctx: ExtensionContext): void {
+	syncLogoutState(store);
+	const active = getActiveProfile(store);
+	const loggedIn = active ? isProfileLoggedIn(store, active.key) : false;
+	if (active) {
+		ctx.ui.setStatus("qwen-oauth-profiles", `Qwen: ${active.label}${loggedIn ? "" : " (not logged in)"}`);
+	}
+}
+
 export default function registerQwenOAuthProvider(pi: ExtensionAPI) {
 	// Always register payload normalization
 	pi.on("before_provider_request", (event) => normalizeQwenPortalPayload(event.payload));
 
 	if (PROFILES_ENABLED) {
-		registerProfilesMode(pi);
+		registerProfileMode(pi);
 	} else {
 		registerNormalMode(pi);
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Normal mode (unchanged behavior)
+// Normal mode
 // ---------------------------------------------------------------------------
 
 function registerNormalMode(pi: ExtensionAPI): void {
-	// Migrate active profile credentials from profile store to auth.json
-	const migrated = migrateProfileToAuth();
-
-	if (migrated) {
-		pi.on("session_start", async (_event, ctx) => {
-			ctx.ui.notify("Migrated active Qwen OAuth profile credentials to normal mode.", "info");
-		});
+	// If a profile store exists (user previously used profile mode), sync
+	// the active profile's credentials to auth.json as a one-time migration.
+	const profilesPath = getProfilesFilePath();
+	if (fs.existsSync(profilesPath)) {
+		const store = loadProfileStore();
+		const active = getActiveProfile(store);
+		const cred = active ? getCredential(store, active.key) : undefined;
+		if (cred?.access && cred?.refresh) {
+			const authData = readAuthJson();
+			const existing = authData["qwen-oauth"];
+			if (!existing || typeof existing !== "object" || (existing as Record<string, unknown>).access !== cred.access) {
+				authData["qwen-oauth"] = {
+					type: "oauth",
+					access: cred.access,
+					refresh: cred.refresh,
+					expires: cred.expires,
+					enterpriseUrl: cred.enterpriseUrl,
+				};
+				writeAuthJson(authData);
+				pi.on("session_start", async (_event, ctx) => {
+					ctx.ui.notify("Migrated active Qwen OAuth profile credentials to normal mode.", "info");
+				});
+			}
+		}
 	}
 
 	pi.registerProvider("qwen-oauth", {
@@ -1352,20 +1522,7 @@ function registerNormalMode(pi: ExtensionAPI): void {
 			"X-DashScope-UserAgent": QWEN_PORTAL_USER_AGENT,
 			"User-Agent": QWEN_PORTAL_USER_AGENT,
 		},
-		models: MODELS.map((model) => ({
-			id: model.id,
-			name: model.name,
-			reasoning: model.reasoning,
-			input: model.input,
-			cost: ZERO_COST,
-			contextWindow: model.contextWindow,
-			maxTokens: model.maxTokens,
-			compat: {
-				supportsDeveloperRole: false,
-				maxTokensField: "max_tokens",
-				...(model.reasoning ? { thinkingFormat: "qwen" as const } : {}),
-			},
-		})),
+		models: PROVIDER_MODELS,
 		oauth: {
 			name: "Qwen OAuth",
 			login: loginQwen,
@@ -1380,39 +1537,29 @@ function registerNormalMode(pi: ExtensionAPI): void {
 }
 
 // ---------------------------------------------------------------------------
-// Profiles mode
+// Profile mode
 // ---------------------------------------------------------------------------
 
-function registerProfilesMode(pi: ExtensionAPI): void {
-	// Load and migrate profile store
+function registerProfileMode(pi: ExtensionAPI): void {
 	const store = loadProfileStore();
 	const migrated = migrateOldCredentials(store);
 
-	// Register /qwen-profile command
+	// Sync active profile credentials to auth.json so framework sees "logged in"
+	syncCredentialToAuth(store);
+
 	registerProfileCommand(pi, store);
 
-	// Notify about active profile on session start
 	pi.on("session_start", async (_event, ctx) => {
 		if (migrated) {
 			ctx.ui.notify("Imported existing Qwen OAuth login into profile \"Default\".", "info");
 		}
-		const active = getActiveProfile(store);
-		const loggedIn = active ? isProfileLoggedIn(store, active.key) : false;
-		if (active) {
-			ctx.ui.setStatus("qwen-oauth-profiles", `Qwen: ${active.label}${loggedIn ? "" : " (not logged in)"}`);
-		}
+		updateProfileStatus(store, ctx);
 	});
 
-	// Update status after each turn
 	pi.on("turn_end", (_event, ctx) => {
-		const active = getActiveProfile(store);
-		const loggedIn = active ? isProfileLoggedIn(store, active.key) : false;
-		if (active) {
-			ctx.ui.setStatus("qwen-oauth-profiles", `Qwen: ${active.label}${loggedIn ? "" : " (not logged in)"}`);
-		}
+		updateProfileStatus(store, ctx);
 	});
 
-	// Register provider with custom streamSimple
 	pi.registerProvider("qwen-oauth", {
 		baseUrl: QWEN_DEFAULT_BASE_URL,
 		apiKey: "QWEN_OAUTH_PLACEHOLDER",
@@ -1422,161 +1569,47 @@ function registerProfilesMode(pi: ExtensionAPI): void {
 			"X-DashScope-UserAgent": QWEN_PORTAL_USER_AGENT,
 			"User-Agent": QWEN_PORTAL_USER_AGENT,
 		},
-		models: MODELS.map((model) => ({
-			id: model.id,
-			name: model.name,
-			reasoning: model.reasoning,
-			input: model.input,
-			cost: ZERO_COST,
-			contextWindow: model.contextWindow,
-			maxTokens: model.maxTokens,
-			compat: {
-				supportsDeveloperRole: false,
-				maxTokensField: "max_tokens",
-				...(model.reasoning ? { thinkingFormat: "qwen" as const } : {}),
-			},
-		})),
-		streamSimple: (model, context, options) => {
-			// Re-read store to pick up changes from other sessions/commands
-			const currentStore = loadProfileStore();
-			const activeProfile = getActiveProfile(currentStore);
-			if (!activeProfile) {
-				throw new Error("No active Qwen OAuth profile configured.");
-			}
-
-			// Get or refresh token
-			const tokenPromise = ensureValidProfileToken(currentStore, activeProfile.key);
-
-			// Build a wrapper stream that waits for the token then creates the real stream
-			const wrapper = createAssistantMessageEventStream();
-
-			tokenPromise.then((cred) => {
-				const baseUrl = cred.enterpriseUrl ? normalizeBaseUrl(cred.enterpriseUrl) : QWEN_DEFAULT_BASE_URL;
-
-				// Convert pi context messages to the format buildOpenAIMessages expects
-				const adaptedContext = {
-					messages: context.messages.map((m) => ({
-						role: m.role,
-						content: m.content,
-						toolCallId: (m as Record<string, unknown>).toolCallId as string | undefined,
-						toolName: (m as Record<string, unknown>).toolName as string | undefined,
-					})),
-					systemPrompt: context.systemPrompt,
-				};
-
-				const realStream = createQwenStream(
-					model.id,
-					baseUrl,
-					model.headers,
-					adaptedContext,
-					cred.access,
-					{
-						temperature: options?.temperature,
-						maxTokens: options?.maxTokens,
-						reasoning: options?.reasoning,
-						signal: options?.signal,
-					},
-				);
-
-				// Pipe real stream events to wrapper
-				(async () => {
-					try {
-						for await (const event of realStream) {
-							wrapper.push(event);
-						}
-						wrapper.end(await realStream.result());
-					} catch (error) {
-						wrapper.push({
-							type: "error",
-							reason: "error",
-							error: {
-								role: "assistant",
-								content: [],
-								api: "openai-completions",
-								provider: "qwen-oauth",
-								model: model.id,
-								usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-								stopReason: "error",
-								errorMessage: error instanceof Error ? error.message : String(error),
-								timestamp: Date.now(),
-							},
-						});
-						wrapper.end({
-							role: "assistant",
-							content: [],
-							api: "openai-completions",
-							provider: "qwen-oauth",
-							model: model.id,
-							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-							stopReason: "error",
-							errorMessage: error instanceof Error ? error.message : String(error),
-							timestamp: Date.now(),
-						});
-					}
-				})();
-			}).catch((error) => {
-				wrapper.push({
-					type: "error",
-					reason: "error",
-					error: {
-						role: "assistant",
-						content: [],
-						api: "openai-completions",
-						provider: "qwen-oauth",
-						model: model.id,
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-						stopReason: "error",
-						errorMessage: error instanceof Error ? error.message : String(error),
-						timestamp: Date.now(),
-					},
-				});
-				wrapper.end({
-					role: "assistant",
-					content: [],
-					api: "openai-completions",
-					provider: "qwen-oauth",
-					model: model.id,
-					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-					stopReason: "error",
-					errorMessage: error instanceof Error ? error.message : String(error),
-					timestamp: Date.now(),
-				});
-			});
-
-			return wrapper;
-		},
+		models: PROVIDER_MODELS,
+		streamSimple: createProfileStreamSimple(),
 		oauth: {
 			name: "Qwen OAuth",
 			login: async (callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> => {
-				// Login to the currently active profile
 				const currentStore = loadProfileStore();
 				const active = getActiveProfile(currentStore);
 				if (!active) {
 					throw new Error("No active Qwen OAuth profile. Run /qwen-profile to set one up.");
 				}
-				return loginProfile(currentStore, active.key, callbacks);
+				const result = await loginProfile(currentStore, active.key, callbacks);
+				syncCredentialToAuth(currentStore);
+				return result;
 			},
-			refreshToken: async (credentials: OAuthCredentials): Promise<OAuthCredentials> => {
-				// Find which profile matches this credential's refresh token
+			refreshToken: async (_credentials: OAuthCredentials): Promise<OAuthCredentials> => {
+				// Always refresh the active profile — ignore framework's stale cred
 				const currentStore = loadProfileStore();
-				for (const profile of currentStore.profiles) {
-					const cred = getCredential(currentStore, profile.key);
-					if (cred?.refresh === credentials.refresh) {
-						const refreshed = await refreshProfileCredential(currentStore, profile.key);
-						return {
-							refresh: refreshed.refresh,
-							access: refreshed.access,
-							expires: refreshed.expires,
-							enterpriseUrl: refreshed.enterpriseUrl,
-						};
-					}
+				const active = getActiveProfile(currentStore);
+				if (!active) {
+					throw new Error("No active Qwen OAuth profile.");
 				}
-				// Fallback: refresh via the passed credentials (won't update our store)
-				return refreshQwenToken(credentials);
+				const cred = getCredential(currentStore, active.key);
+				if (!cred?.refresh) {
+					throw new Error(`Profile "${active.key}" has no refresh token; run /login qwen-oauth`);
+				}
+				const refreshed = await refreshProfileCredential(currentStore, active.key);
+				syncCredentialToAuth(currentStore);
+				return {
+					refresh: refreshed.refresh,
+					access: refreshed.access,
+					expires: refreshed.expires,
+					enterpriseUrl: refreshed.enterpriseUrl,
+				};
 			},
 			getApiKey: (credentials) => credentials.access,
-			modifyModels: (models, credentials) => {
-				const baseUrl = normalizeBaseUrl(credentials.enterpriseUrl as string | undefined);
+			modifyModels: (models, _credentials) => {
+				// Use vault's active profile enterpriseUrl, not framework's stale cred
+				const currentStore = loadProfileStore();
+				const active = getActiveProfile(currentStore);
+				const cred = active ? getCredential(currentStore, active.key) : undefined;
+				const baseUrl = normalizeBaseUrl(cred?.enterpriseUrl);
 				return models.map((model) => (model.provider === "qwen-oauth" ? { ...model, baseUrl } : model));
 			},
 		},
