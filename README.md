@@ -15,7 +15,6 @@ Qwen OAuth provider for [pi](https://github.com/badlogic/pi-mono). Log in with y
 - **Correct endpoint routing** — OAuth sessions route to `https://portal.qwen.ai/v1`, DashScope hosts fall back to `/compatible-mode/v1`
 - **Request normalization** — system messages formatted as Qwen Portal-compatible content parts
 - **Thinking mode** — toggle thinking on/off via the TUI reasoning selector (Qwen Portal API supports `enable_thinking` as a boolean)
-- **Optional multi-account mode** — register extra Qwen accounts as separate providers (`qwen-oauth-2`, `qwen-oauth-3`, ...) to avoid cross-session token conflicts
 
 ## Quick Start
 
@@ -45,18 +44,18 @@ pi install .
 
 ## Models
 
-| Alias | Input | Context | Max Tokens | Reasoning |
-|---|---|---|---|---|
-| `qwen-oauth/coder-model` | text | 1M | 65,536 | ✅ |
+| Alias                    | Input | Context | Max Tokens | Reasoning |
+| ------------------------ | ----- | ------- | ---------- | --------- |
+| `qwen-oauth/coder-model` | text  | 1M      | 65,536     | ✅        |
 
 ## Thinking Mode
 
 The model has reasoning enabled. The pi TUI displays a thinking effort selector (off / minimal / low / medium / high). The Qwen Portal API only accepts `enable_thinking` as a boolean:
 
-| TUI Selection | API Parameter |
-|---|---|
-| off | `enable_thinking: false` |
-| minimal / low / medium / high | `enable_thinking: true` |
+| TUI Selection                 | API Parameter            |
+| ----------------------------- | ------------------------ |
+| off                           | `enable_thinking: false` |
+| minimal / low / medium / high | `enable_thinking: true`  |
 
 Granular `thinking_budget` control is not supported by the Qwen Portal API — the model uses its own internal reasoning budget when thinking is enabled.
 
@@ -64,9 +63,9 @@ Granular `thinking_budget` control is not supported by the Qwen Portal API — t
 
 Qwen exposes multiple API surfaces with different authentication flows:
 
-| Auth Method | Endpoint |
-|---|---|
-| Qwen OAuth (qwen.ai account) | `https://portal.qwen.ai/v1` |
+| Auth Method                       | Endpoint                                            |
+| --------------------------------- | --------------------------------------------------- |
+| Qwen OAuth (qwen.ai account)      | `https://portal.qwen.ai/v1`                         |
 | Alibaba Cloud / DashScope API key | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 
 A common mistake is authenticating with Qwen OAuth but sending requests to DashScope paths, which returns `404`. This extension handles the full OAuth device-code flow and routes requests to the correct endpoint.
@@ -92,9 +91,9 @@ npm run check    # Run tests
 npm run prepack  # Run tests before publish
 ```
 
-### Multi-Account Mode
+## Multi-Account Mode
 
-An opt-in feature for managing multiple Qwen OAuth accounts as separate providers. Set `PI_QWEN_OAUTH_PROFILES=true` to enable. See [docs/multi-profile.md](docs/multi-profile.md) for details.
+Set `PI_QWEN_OAUTH_PROFILES=true` to manage multiple Qwen OAuth accounts. See [docs/multi-profile.md](docs/multi-profile.md) for details.
 
 ## References
 

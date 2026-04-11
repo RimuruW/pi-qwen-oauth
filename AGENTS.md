@@ -3,14 +3,16 @@
 ## Project Structure & Module Organization
 
 ```
-├── index.ts            # Main extension entry point — registers the Qwen OAuth provider
+├── index.ts            # Main extension entry point — provider registration, OAuth flow, and multi-account mode
+├── docs/
+│   └── multi-profile.md      # Multi-account mode documentation
 ├── tests/
-│   └── qwen-oauth.test.ts  # Provider tests
+│   └── qwen-oauth.test.ts    # Provider tests
 ├── package.json        # Package metadata, scripts, and peer dependencies
 └── README.md           # User-facing documentation
 ```
 
-This is a **pi extension** (no build step). TypeScript is loaded directly via `node --experimental-strip-types`. The single entry point `index.ts` exports a default function that pi invokes to register the `qwen-oauth` provider.
+This is a **pi extension** (no build step). TypeScript is loaded directly via `node --experimental-strip-types`. The single entry point `index.ts` exports a default function that pi invokes to register the `qwen-oauth` provider (and additional `qwen-oauth-N` providers when multi-account mode is enabled).
 
 ## Build, Test, and Development Commands
 
@@ -34,7 +36,7 @@ Node.js ≥ 20 is required. Peer dependencies: `@mariozechner/pi-ai` and `@mario
 - **Framework**: Node.js native test runner (`node --test`).
 - **File naming**: `*.test.ts` in `tests/`.
 - **Run**: `npm run check`.
-- Tests cover OAuth device flow, token polling, payload normalization, and provider registration. Add tests for new models, endpoint changes, or payload transformation logic.
+- Tests cover OAuth device flow, token polling, payload normalization, and provider registration. Add tests for new models, endpoint changes, payload transformation logic, or multi-account store operations.
 
 ## Commit & Pull Request Guidelines
 
