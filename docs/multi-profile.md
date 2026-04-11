@@ -1,8 +1,8 @@
-# Multi-Profile Mode
+# Multi-Account Mode
 
-> **Not maintained as an official feature.** This feature is provided for developer and research reference only. It is not part of the stable public API, may change or be removed without notice, and is not designed for production or multi-user environments.
+> **Opt-in feature.** This mode is intended for users who need to keep multiple Qwen OAuth accounts available at the same time, especially across parallel pi sessions.
 
-Manage multiple Qwen OAuth accounts (e.g., personal, work) with independent credentials through a single provider (`qwen-oauth`). The active profile determines which account's token is used for requests — model references (`qwen-oauth/coder-model`) remain unchanged regardless of the active profile.
+Manage multiple Qwen OAuth accounts (for example personal and work) as **separate providers** instead of a single provider with a global active profile. This avoids local cross-session state conflicts when one session logs in, refreshes, or logs out.
 
 ## Enable
 
@@ -12,74 +12,77 @@ Set the environment variable:
 export PI_QWEN_OAUTH_PROFILES=true
 ```
 
-When this variable is not set, the extension behaves identically to the single-account mode described in the main README.
+When this variable is not set, the extension behaves like the normal single-account mode and only registers `qwen-oauth`.
 
 ## How It Works
 
-- Profile definitions and credentials are stored in `~/.pi/agent/qwen-oauth-profiles.json`
-- Each profile has its own independent OAuth token
-- The **active profile** determines which token is used for API requests
-- Requests pick up the active profile's token at send time — switching profiles takes effect immediately
+- Account metadata is stored in `~/.pi/agent/qwen-oauth-profiles.json`
+- OAuth credentials stay in pi's normal auth store (`~/.pi/agent/auth.json`), keyed by provider name
+- Each account gets its own provider name:
+  - `qwen-oauth`
+  - `qwen-oauth-2`
+  - `qwen-oauth-3`
+- Each provider keeps its own token lifecycle and refresh path
+- Parallel sessions can use different Qwen providers without sharing a global active account pointer
 
-## Profile Store
+## Account Store
 
-Profiles are stored in `~/.pi/agent/qwen-oauth-profiles.json`:
+Accounts are stored in `~/.pi/agent/qwen-oauth-profiles.json`:
 
 ```json
 {
-  "version": 1,
-  "activeProfile": "default",
-  "profiles": [
-    { "key": "default", "label": "Default" },
-    { "key": "work", "label": "Work" },
-    { "key": "personal", "label": "Personal" }
-  ],
-  "credentials": {}
+  "version": 2,
+  "accounts": [
+    { "provider": "qwen-oauth", "label": "Default" },
+    { "provider": "qwen-oauth-2", "label": "Work" },
+    { "provider": "qwen-oauth-3", "label": "Personal" }
+  ]
 }
 ```
 
-Credentials are automatically populated when you log in to each profile.
+This file stores **labels and provider identities only**. Tokens are not stored here.
 
 ## Commands
 
 ```text
-/qwen-profile              # Open interactive profile panel
-/qwen-profile list         # Show all profiles and their status
-/qwen-profile use work     # Switch active profile
-/qwen-profile login work   # Login to a specific profile
-/qwen-profile add backup   # Add a new profile
-/qwen-profile rename work "工作号"  # Rename a profile's label
-/qwen-profile remove work  # Remove a profile and its credentials
+/qwen-profile                        # Open interactive account panel
+/qwen-profile list                   # Show all accounts and their status
+/qwen-profile add Work               # Add a new account (creates qwen-oauth-N)
+/qwen-profile login qwen-oauth-2     # Show login instructions for a specific provider
+/qwen-profile rename qwen-oauth-2 工作号
+/qwen-profile remove qwen-oauth-2    # Remove the account and its saved auth entry
 ```
 
-## Interactive Panel
+## Login Flow
 
-Running `/qwen-profile` without arguments opens a TUI panel where you can:
+After adding an account, run `/login` and select the matching OAuth entry shown by pi, for example:
 
-- **Select** a profile to view details
-- **Switch** the active profile
-- **Login/Refresh** token for a profile
-- **Rename** the display label
-- **Remove** a profile (not `default`)
-
-## Migration from Single-Account Mode
-
-If you were previously logged in with `/login qwen-oauth` before enabling multi-profile mode, your existing credentials are automatically imported into the `default` profile on first startup. You don't need to re-login.
-
-## `/login qwen-oauth` in Profiles Mode
-
-When multi-profile mode is active, `/login qwen-oauth` logs in to the **currently active profile**. Use `/qwen-profile login <key>` to login to a specific profile directly.
-
-## Status Bar
-
-When profiles mode is active, the footer status bar shows the current profile:
-
+```text
+Qwen OAuth
+Qwen OAuth — Work
+Qwen OAuth — Personal
 ```
-Qwen: Default
-Qwen: Work (not logged in)
+
+Then select the corresponding model directly:
+
+```text
+/model qwen-oauth/coder-model
+/model qwen-oauth-2/coder-model
+/model qwen-oauth-3/coder-model
 ```
+
+## Migration from Legacy Profile Mode
+
+If you previously used the old global-active-profile implementation, the first startup in multi-account mode automatically migrates:
+
+- the legacy profile list to provider-based account metadata
+- the legacy stored credentials to provider-specific auth entries
+
+The previously active legacy profile becomes `qwen-oauth` so existing model selections remain as stable as possible.
 
 ## Limitations
 
-- The active profile is **process-global** (shared across all pi sessions on the same machine).
-- `/logout qwen-oauth` is not the recommended way to manage accounts in profiles mode. Use `/qwen-profile remove <key>` instead.
+- This only fixes **local provider/account isolation** inside pi
+- If Qwen invalidates old tokens when the **same Qwen account** logs in elsewhere, that behavior still applies; the reliable workaround is using separate Qwen accounts
+- Provider names are part of the trade-off: multiple accounts mean multiple model prefixes
+- Removing an account deletes its saved auth entry for that provider

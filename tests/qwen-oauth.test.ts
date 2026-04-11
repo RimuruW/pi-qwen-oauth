@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import registerQwenOAuthProvider, { refreshQwenToken, loginQwen } from "../index.ts";
-import type { OAuthCredentials } from "@mariozechner/pi-ai";
 
 type ProviderRegistration = {
 	name: string;
@@ -11,20 +13,44 @@ type ProviderRegistration = {
 		models: Array<{ id: string; compat?: { thinkingFormat?: string } }>;
 		headers?: Record<string, string>;
 		oauth?: {
-			modifyModels?: (models: Array<{ provider: string; baseUrl?: string }>, credentials: { enterpriseUrl?: string }) => Array<{ provider: string; baseUrl?: string }>;
+			name?: string;
+			modifyModels?: (
+				models: Array<{ provider: string; baseUrl?: string }>,
+				credentials: { enterpriseUrl?: string },
+			) => Array<{ provider: string; baseUrl?: string }>;
 		};
 	};
 };
 
 type BeforeProviderRequestHandler = (event: { payload: unknown }) => unknown;
 
-function registerExtension(): { registration: ProviderRegistration; beforeProviderRequest?: BeforeProviderRequestHandler } {
-	let registration: ProviderRegistration | undefined;
+type CommandRegistration = {
+	description: string;
+	handler: (args: string, ctx: unknown) => Promise<void> | void;
+	getArgumentCompletions?: (prefix: string) => Array<{ value: string; label: string }> | null;
+};
+
+function registerExtension(): {
+	providers: Map<string, ProviderRegistration>;
+	commands: Map<string, CommandRegistration>;
+	unregisteredProviders: string[];
+	beforeProviderRequest?: BeforeProviderRequestHandler;
+} {
+	const providers = new Map<string, ProviderRegistration>();
+	const commands = new Map<string, CommandRegistration>();
+	const unregisteredProviders: string[] = [];
 	let beforeProviderRequest: BeforeProviderRequestHandler | undefined;
 
 	registerQwenOAuthProvider({
 		registerProvider(name: string, config: ProviderRegistration["config"]) {
-			registration = { name, config };
+			providers.set(name, { name, config });
+		},
+		unregisterProvider(name: string) {
+			unregisteredProviders.push(name);
+			providers.delete(name);
+		},
+		registerCommand(name: string, config: CommandRegistration) {
+			commands.set(name, config);
 		},
 		on(event: string, handler: BeforeProviderRequestHandler) {
 			if (event === "before_provider_request") {
@@ -33,22 +59,122 @@ function registerExtension(): { registration: ProviderRegistration; beforeProvid
 		},
 	} as never);
 
-	if (!registration) {
+	if (!providers.has("qwen-oauth")) {
 		throw new Error("Provider registration was not captured");
 	}
 
-	return { registration, beforeProviderRequest };
+	return { providers, commands, unregisteredProviders, beforeProviderRequest };
+}
+
+async function withEnv<T>(
+	env: Record<string, string | undefined>,
+	run: () => Promise<T> | T,
+): Promise<T> {
+	const previous = new Map<string, string | undefined>();
+	for (const [key, value] of Object.entries(env)) {
+		previous.set(key, process.env[key]);
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+
+	try {
+		return await run();
+	} finally {
+		for (const [key, value] of previous.entries()) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+}
+
+async function withTempHome<T>(run: (homeDir: string) => Promise<T> | T): Promise<T> {
+	const homeDir = mkdtempSync(path.join(os.tmpdir(), "pi-qwen-oauth-test-"));
+	return withEnv(
+		{
+			HOME: homeDir,
+			USERPROFILE: homeDir,
+		},
+		async () => {
+			try {
+				return await run(homeDir);
+			} finally {
+				rmSync(homeDir, { recursive: true, force: true });
+			}
+		},
+	);
+}
+
+function agentFile(homeDir: string, fileName: string): string {
+	return path.join(homeDir, ".pi", "agent", fileName);
+}
+
+function writeJson(homeDir: string, fileName: string, value: unknown): void {
+	const filePath = agentFile(homeDir, fileName);
+	mkdirSync(path.dirname(filePath), { recursive: true });
+	writeFileSync(filePath, JSON.stringify(value, null, 2), "utf-8");
+}
+
+function readJson(homeDir: string, fileName: string): unknown {
+	return JSON.parse(readFileSync(agentFile(homeDir, fileName), "utf-8"));
+}
+
+function createCommandContext(options?: {
+	hasUI?: boolean;
+	inputResponses?: string[];
+	confirmResponses?: boolean[];
+	selectResponses?: string[];
+}) {
+	const notifications: Array<{ message: string; level: string }> = [];
+	const inputResponses = [...(options?.inputResponses || [])];
+	const confirmResponses = [...(options?.confirmResponses || [])];
+	const selectResponses = [...(options?.selectResponses || [])];
+	let refreshCount = 0;
+
+	const ctx = {
+		hasUI: options?.hasUI ?? true,
+		ui: {
+			notify(message: string, level: string) {
+				notifications.push({ message, level });
+			},
+			async input() {
+				return inputResponses.shift() || "";
+			},
+			async confirm() {
+				return confirmResponses.shift() || false;
+			},
+			async select() {
+				return selectResponses.shift();
+			},
+		},
+		modelRegistry: {
+			refresh() {
+				refreshCount++;
+			},
+		},
+	};
+
+	return {
+		ctx,
+		notifications,
+		get refreshCount() {
+			return refreshCount;
+		},
+	};
 }
 
 test("registers Qwen OAuth against the Qwen portal endpoint by default", () => {
-	const { registration } = registerExtension();
+	const { providers } = registerExtension();
+	const registration = providers.get("qwen-oauth");
+	if (!registration) throw new Error("Expected qwen-oauth provider");
 
 	assert.equal(registration.name, "qwen-oauth");
 	assert.equal(registration.config.baseUrl, "https://portal.qwen.ai/v1");
 });
 
 test("registers only the coder-model", () => {
-	const { registration } = registerExtension();
+	const { providers } = registerExtension();
+	const registration = providers.get("qwen-oauth");
+	if (!registration) throw new Error("Expected qwen-oauth provider");
 
 	assert.deepEqual(
 		registration.config.models.map((model) => model.id),
@@ -57,7 +183,9 @@ test("registers only the coder-model", () => {
 });
 
 test("maps OAuth resource_url from portal hosts to /v1 instead of /compatible-mode/v1", () => {
-	const { registration } = registerExtension();
+	const { providers } = registerExtension();
+	const registration = providers.get("qwen-oauth");
+	if (!registration) throw new Error("Expected qwen-oauth provider");
 	const modifyModels = registration.config.oauth?.modifyModels;
 
 	if (!modifyModels) {
@@ -73,7 +201,9 @@ test("maps OAuth resource_url from portal hosts to /v1 instead of /compatible-mo
 });
 
 test("keeps DashScope hosts on the OpenAI-compatible /compatible-mode/v1 path", () => {
-	const { registration } = registerExtension();
+	const { providers } = registerExtension();
+	const registration = providers.get("qwen-oauth");
+	if (!registration) throw new Error("Expected qwen-oauth provider");
 	const modifyModels = registration.config.oauth?.modifyModels;
 
 	if (!modifyModels) {
@@ -89,12 +219,14 @@ test("keeps DashScope hosts on the OpenAI-compatible /compatible-mode/v1 path", 
 });
 
 test("adds the Qwen Portal headers required for OAuth chat completions", () => {
-	const { registration } = registerExtension();
+	const { providers } = registerExtension();
+	const registration = providers.get("qwen-oauth");
+	if (!registration) throw new Error("Expected qwen-oauth provider");
 
 	assert.deepEqual(registration.config.headers, {
 		"X-DashScope-AuthType": "qwen-oauth",
-		"X-DashScope-UserAgent": "QwenCode/0.14.0 (darwin; arm64)",
-		"User-Agent": "QwenCode/0.14.0 (darwin; arm64)",
+		"X-DashScope-UserAgent": "QwenCode/0.14.3 (darwin; arm64)",
+		"User-Agent": "QwenCode/0.14.3 (darwin; arm64)",
 	});
 });
 
@@ -155,11 +287,301 @@ test("leaves non-Qwen payloads untouched", () => {
 });
 
 test("uses thinkingFormat qwen to map effort to enable_thinking boolean", () => {
-	const { registration } = registerExtension();
+	const { providers } = registerExtension();
+	const registration = providers.get("qwen-oauth");
+	if (!registration) throw new Error("Expected qwen-oauth provider");
 
 	for (const model of registration.config.models) {
-		assert.equal(model.compat?.thinkingFormat, "qwen", `model ${model.id} should use thinkingFormat "qwen"`);
+		assert.equal(model.compat?.thinkingFormat, "qwen", `model ${model.id} should use thinkingFormat \"qwen\"`);
 	}
+});
+
+test("registers extra providers from the multi-account store in profiles mode", async () => {
+	await withTempHome(async (homeDir) => {
+		writeJson(homeDir, "qwen-oauth-profiles.json", {
+			version: 2,
+			accounts: [
+				{ provider: "qwen-oauth", label: "Default" },
+				{ provider: "qwen-oauth-2", label: "Work" },
+			],
+		});
+
+		const { providers, commands } = await withEnv(
+			{ PI_QWEN_OAUTH_PROFILES: "true" },
+			() => registerExtension(),
+		);
+
+		assert.deepEqual([...providers.keys()].sort(), ["qwen-oauth", "qwen-oauth-2"]);
+		assert.equal(providers.get("qwen-oauth-2")?.config.oauth?.name, "Qwen OAuth — Work");
+		assert.ok(commands.has("qwen-profile"), "expected account management command to remain registered");
+	});
+});
+
+test("migrates legacy profile store to provider-specific auth entries", async () => {
+	await withTempHome(async (homeDir) => {
+		writeJson(homeDir, "qwen-oauth-profiles.json", {
+			version: 1,
+			activeProfile: "work",
+			profiles: [
+				{ key: "default", label: "Default" },
+				{ key: "work", label: "Work" },
+			],
+			credentials: {
+				default: {
+					access: "default-access",
+					refresh: "default-refresh",
+					expires: 111111,
+					enterpriseUrl: "portal.qwen.ai",
+				},
+				work: {
+					access: "work-access",
+					refresh: "work-refresh",
+					expires: 222222,
+					enterpriseUrl: "dashscope.aliyuncs.com",
+				},
+			},
+		});
+		writeJson(homeDir, "auth.json", {});
+
+		await withEnv({ PI_QWEN_OAUTH_PROFILES: "true" }, () => registerExtension());
+
+		assert.deepEqual(readJson(homeDir, "qwen-oauth-profiles.json"), {
+			version: 2,
+			accounts: [
+				{ provider: "qwen-oauth", label: "Work" },
+				{ provider: "qwen-oauth-2", label: "Default" },
+			],
+		});
+		assert.deepEqual(readJson(homeDir, "auth.json"), {
+			"qwen-oauth": {
+				type: "oauth",
+				access: "work-access",
+				refresh: "work-refresh",
+				expires: 222222,
+				enterpriseUrl: "dashscope.aliyuncs.com",
+			},
+			"qwen-oauth-2": {
+				type: "oauth",
+				access: "default-access",
+				refresh: "default-refresh",
+				expires: 111111,
+				enterpriseUrl: "portal.qwen.ai",
+			},
+		});
+	});
+});
+
+test("normal mode legacy migration does not overwrite an existing qwen-oauth login", async () => {
+	await withTempHome(async (homeDir) => {
+		writeJson(homeDir, "qwen-oauth-profiles.json", {
+			version: 1,
+			activeProfile: "work",
+			profiles: [
+				{ key: "default", label: "Default" },
+				{ key: "work", label: "Work" },
+			],
+			credentials: {
+				work: {
+					access: "legacy-access",
+					refresh: "legacy-refresh",
+					expires: 222222,
+					enterpriseUrl: "dashscope.aliyuncs.com",
+				},
+			},
+		});
+		writeJson(homeDir, "auth.json", {
+			"qwen-oauth": {
+				type: "oauth",
+				access: "current-access",
+				refresh: "current-refresh",
+				expires: 999999,
+				enterpriseUrl: "portal.qwen.ai",
+			},
+		});
+
+		registerExtension();
+
+		assert.deepEqual(readJson(homeDir, "auth.json"), {
+			"qwen-oauth": {
+				type: "oauth",
+				access: "current-access",
+				refresh: "current-refresh",
+				expires: 999999,
+				enterpriseUrl: "portal.qwen.ai",
+			},
+		});
+	});
+});
+
+test("qwen-profile list shows logged-in, refresh-pending, and logged-out account states", async () => {
+	await withTempHome(async (homeDir) => {
+		writeJson(homeDir, "qwen-oauth-profiles.json", {
+			version: 2,
+			accounts: [
+				{ provider: "qwen-oauth", label: "Default" },
+				{ provider: "qwen-oauth-2", label: "Work" },
+				{ provider: "qwen-oauth-3", label: "Personal" },
+			],
+		});
+		writeJson(homeDir, "auth.json", {
+			"qwen-oauth": {
+				type: "oauth",
+				access: "live-access",
+				refresh: "live-refresh",
+				expires: Date.now() + 60_000,
+			},
+			"qwen-oauth-2": {
+				type: "oauth",
+				access: "stale-access",
+				refresh: "stale-refresh",
+				expires: Date.now() - 60_000,
+			},
+		});
+
+		const { commands } = await withEnv(
+			{ PI_QWEN_OAUTH_PROFILES: "true" },
+			() => registerExtension(),
+		);
+		const command = commands.get("qwen-profile");
+		if (!command) throw new Error("Expected qwen-profile command");
+		const { ctx, notifications } = createCommandContext({ hasUI: false });
+
+		await command.handler("list", ctx);
+
+		assert.deepEqual(notifications, [{
+			message: [
+				"Default (qwen-oauth) - logged in",
+				"Work (qwen-oauth-2) - token expired — will refresh on next request",
+				"Personal (qwen-oauth-3) - not logged in",
+			].join("\n"),
+			level: "info",
+		}]);
+	});
+});
+
+test("qwen-profile add persists a new account, registers its provider, and prompts login", async () => {
+	await withTempHome(async (homeDir) => {
+		writeJson(homeDir, "qwen-oauth-profiles.json", {
+			version: 2,
+			accounts: [{ provider: "qwen-oauth", label: "Default" }],
+		});
+
+		const { commands, providers } = await withEnv(
+			{ PI_QWEN_OAUTH_PROFILES: "true" },
+			() => registerExtension(),
+		);
+		const command = commands.get("qwen-profile");
+		if (!command) throw new Error("Expected qwen-profile command");
+		const commandCtx = createCommandContext();
+
+		await command.handler("add Work", commandCtx.ctx);
+
+		assert.deepEqual(readJson(homeDir, "qwen-oauth-profiles.json"), {
+			version: 2,
+			accounts: [
+				{ provider: "qwen-oauth", label: "Default" },
+				{ provider: "qwen-oauth-2", label: "Work" },
+			],
+		});
+		assert.equal(providers.get("qwen-oauth-2")?.config.oauth?.name, "Qwen OAuth — Work");
+		assert.equal(commandCtx.refreshCount, 1);
+		assert.deepEqual(commandCtx.notifications, [
+			{ message: "Added account: Work (qwen-oauth-2)", level: "info" },
+			{
+				message: 'Use /login and select "Qwen OAuth — Work" to authenticate Work.',
+				level: "info",
+			},
+		]);
+	});
+});
+
+test("qwen-profile rename updates metadata and provider display name", async () => {
+	await withTempHome(async (homeDir) => {
+		writeJson(homeDir, "qwen-oauth-profiles.json", {
+			version: 2,
+			accounts: [
+				{ provider: "qwen-oauth", label: "Default" },
+				{ provider: "qwen-oauth-2", label: "Work" },
+			],
+		});
+
+		const { commands, providers } = await withEnv(
+			{ PI_QWEN_OAUTH_PROFILES: "true" },
+			() => registerExtension(),
+		);
+		const command = commands.get("qwen-profile");
+		if (!command) throw new Error("Expected qwen-profile command");
+		const commandCtx = createCommandContext();
+
+		await command.handler("rename qwen-oauth-2 Team", commandCtx.ctx);
+
+		assert.deepEqual(readJson(homeDir, "qwen-oauth-profiles.json"), {
+			version: 2,
+			accounts: [
+				{ provider: "qwen-oauth", label: "Default" },
+				{ provider: "qwen-oauth-2", label: "Team" },
+			],
+		});
+		assert.equal(providers.get("qwen-oauth-2")?.config.oauth?.name, "Qwen OAuth — Team");
+		assert.equal(commandCtx.refreshCount, 1);
+		assert.deepEqual(commandCtx.notifications, [
+			{ message: "Renamed qwen-oauth-2 to: Team", level: "info" },
+		]);
+	});
+});
+
+test("qwen-profile remove deletes the auth entry and unregisters the provider", async () => {
+	await withTempHome(async (homeDir) => {
+		writeJson(homeDir, "qwen-oauth-profiles.json", {
+			version: 2,
+			accounts: [
+				{ provider: "qwen-oauth", label: "Default" },
+				{ provider: "qwen-oauth-2", label: "Work" },
+			],
+		});
+		writeJson(homeDir, "auth.json", {
+			"qwen-oauth": {
+				type: "oauth",
+				access: "default-access",
+				refresh: "default-refresh",
+				expires: Date.now() + 60_000,
+			},
+			"qwen-oauth-2": {
+				type: "oauth",
+				access: "work-access",
+				refresh: "work-refresh",
+				expires: Date.now() + 60_000,
+			},
+		});
+
+		const { commands, providers, unregisteredProviders } = await withEnv(
+			{ PI_QWEN_OAUTH_PROFILES: "true" },
+			() => registerExtension(),
+		);
+		const command = commands.get("qwen-profile");
+		if (!command) throw new Error("Expected qwen-profile command");
+		const commandCtx = createCommandContext();
+
+		await command.handler("remove qwen-oauth-2", commandCtx.ctx);
+
+		assert.deepEqual(readJson(homeDir, "qwen-oauth-profiles.json"), {
+			version: 2,
+			accounts: [{ provider: "qwen-oauth", label: "Default" }],
+		});
+		const auth = readJson(homeDir, "auth.json") as Record<string, unknown>;
+		assert.ok(!("qwen-oauth-2" in auth));
+		const defaultEntry = auth["qwen-oauth"] as Record<string, unknown>;
+		assert.equal(defaultEntry.type, "oauth");
+		assert.equal(defaultEntry.access, "default-access");
+		assert.equal(defaultEntry.refresh, "default-refresh");
+		assert.equal(typeof defaultEntry.expires, "number");
+		assert.ok(!providers.has("qwen-oauth-2"));
+		assert.deepEqual(unregisteredProviders, ["qwen-oauth-2"]);
+		assert.equal(commandCtx.refreshCount, 1);
+		assert.deepEqual(commandCtx.notifications, [
+			{ message: "Removed account: qwen-oauth-2", level: "info" },
+		]);
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -171,11 +593,9 @@ const QWEN_TOKEN_ENDPOINT = "https://chat.qwen.ai/api/v1/oauth2/token";
 const mockFetch = (response: { ok: boolean; status?: number; json: () => Promise<unknown>; text?: () => Promise<string> }) => {
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (url: RequestInfo | URL, init?: RequestInit) => {
-		// Assert the request targets the correct endpoint
 		assert.equal(url.toString(), QWEN_TOKEN_ENDPOINT);
 		assert.equal((init as RequestInit).method, "POST");
 
-		// Assert the request body contains refresh_token grant
 		const body = (init as RequestInit).body as string;
 		const params = new URLSearchParams(body);
 		assert.equal(params.get("grant_type"), "refresh_token");
@@ -214,7 +634,6 @@ test("refreshQwenToken returns new access_token and new refresh_token", async ()
 
 	assert.equal(result.access, "new-access");
 	assert.equal(result.refresh, "new-refresh");
-	// expires should be ~3600s from now, minus 5min buffer (3300s)
 	const delta = result.expires - Date.now();
 	assert.ok(delta > 3290 * 1000 && delta < 3301 * 1000, `expiry delta ${delta}ms should be ~3300000ms`);
 });
@@ -390,7 +809,6 @@ test("loginQwen passes signal to device code fetch", async () => {
 test("loginQwen calls onProgress during long poll", async () => {
 	const progressMessages: string[] = [];
 
-	// Speed up polls by making setTimeout resolve instantly
 	const originalSetTimeout = globalThis.setTimeout;
 	globalThis.setTimeout = ((cb: (...args: unknown[]) => void) => {
 		queueMicrotask(() => cb());
@@ -406,17 +824,14 @@ test("loginQwen calls onProgress during long poll", async () => {
 			interval: 0,
 		}),
 		[
-			// 9x authorization_pending (no progress)
 			...Array(9).fill({
 				ok: false,
 				json: async () => ({ error: "authorization_pending" }),
 			}),
-			// 10th poll triggers onProgress
 			{
 				ok: false,
 				json: async () => ({ error: "authorization_pending" }),
 			},
-			// Success on 11th
 			{
 				ok: true,
 				json: async () => ({

@@ -15,6 +15,7 @@ Qwen OAuth provider for [pi](https://github.com/badlogic/pi-mono). Log in with y
 - **Correct endpoint routing** — OAuth sessions route to `https://portal.qwen.ai/v1`, DashScope hosts fall back to `/compatible-mode/v1`
 - **Request normalization** — system messages formatted as Qwen Portal-compatible content parts
 - **Thinking mode** — toggle thinking on/off via the TUI reasoning selector (Qwen Portal API supports `enable_thinking` as a boolean)
+- **Optional multi-account mode** — register extra Qwen accounts as separate providers (`qwen-oauth-2`, `qwen-oauth-3`, ...) to avoid cross-session token conflicts
 
 ## Quick Start
 
@@ -75,7 +76,7 @@ A common mistake is authenticating with Qwen OAuth but sending requests to DashS
 ```
 ├── index.ts                  # Extension entry point — provider registration & OAuth flow
 ├── docs/
-│   └── multi-profile.md      # Multi-profile mode documentation (dev/research only)
+│   └── multi-profile.md      # Multi-account mode documentation (opt-in)
 ├── tests/
 │   └── qwen-oauth.test.ts    # Provider & normalization tests
 ├── package.json
@@ -91,9 +92,9 @@ npm run check    # Run tests
 npm run prepack  # Run tests before publish
 ```
 
-### Multi-Profile Mode
+### Multi-Account Mode
 
-An opt-in feature for managing multiple Qwen OAuth accounts. Set `PI_QWEN_OAUTH_PROFILES=true` to enable. See [docs/multi-profile.md](docs/multi-profile.md) for details.
+An opt-in feature for managing multiple Qwen OAuth accounts as separate providers. Set `PI_QWEN_OAUTH_PROFILES=true` to enable. See [docs/multi-profile.md](docs/multi-profile.md) for details.
 
 ## References
 
