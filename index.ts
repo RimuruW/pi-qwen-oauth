@@ -149,10 +149,13 @@ function normalizeAccountStore(raw: unknown): AccountStoreData {
     return getDefaultAccountStoreData();
   }
 
-  const accounts = (raw as { accounts: unknown[] }).accounts.filter(isManagedAccount);
+  const accounts = (raw as { accounts: unknown[] }).accounts.filter(
+    isManagedAccount,
+  );
   return {
     version: 2,
-    accounts: accounts.length > 0 ? accounts : getDefaultAccountStoreData().accounts,
+    accounts:
+      accounts.length > 0 ? accounts : getDefaultAccountStoreData().accounts,
   };
 }
 
@@ -196,10 +199,7 @@ function nextAccountProviderName(store: AccountStoreData): string {
   return `qwen-oauth-${index}`;
 }
 
-function addAccount(
-  store: AccountStoreData,
-  label: string,
-): ManagedAccount {
+function addAccount(store: AccountStoreData, label: string): ManagedAccount {
   const account: ManagedAccount = {
     provider: nextAccountProviderName(store),
     label,
@@ -223,7 +223,9 @@ function renameAccountLabel(
 
 function removeAccount(store: AccountStoreData, provider: string): boolean {
   if (isDefaultProvider(provider)) return false;
-  const index = store.accounts.findIndex((account) => account.provider === provider);
+  const index = store.accounts.findIndex(
+    (account) => account.provider === provider,
+  );
   if (index < 0) return false;
   store.accounts.splice(index, 1);
   saveAccountStore(store);
@@ -701,9 +703,11 @@ function registerAccountProvider(
 }
 
 function refreshModelRegistry(ctx: ExtensionContext): void {
-  const modelRegistry = (ctx as unknown as {
-    modelRegistry?: { refresh?: () => void };
-  }).modelRegistry;
+  const modelRegistry = (
+    ctx as unknown as {
+      modelRegistry?: { refresh?: () => void };
+    }
+  ).modelRegistry;
   modelRegistry?.refresh?.();
 }
 
@@ -723,8 +727,9 @@ function showLoginInstructions(
 }
 
 function listAccountLines(store: AccountStoreData): string[] {
-  return store.accounts.map((account) =>
-    `${account.label} (${account.provider}) - ${getProviderStatusLabel(account.provider)}`,
+  return store.accounts.map(
+    (account) =>
+      `${account.label} (${account.provider}) - ${getProviderStatusLabel(account.provider)}`,
   );
 }
 
@@ -734,8 +739,9 @@ async function openAccountPanel(
 ): Promise<void> {
   while (true) {
     const store = loadAccountStore();
-    const accountOptions = store.accounts.map((account) =>
-      `${account.label}  [${account.provider}]  ${getProviderStatusLabel(account.provider)}`,
+    const accountOptions = store.accounts.map(
+      (account) =>
+        `${account.label}  [${account.provider}]  ${getProviderStatusLabel(account.provider)}`,
     );
     const selected = await ctx.ui.select("Qwen OAuth Accounts", [
       ...accountOptions,
@@ -754,7 +760,10 @@ async function openAccountPanel(
       const account = addAccount(store, label.trim());
       registerAccountProvider(pi, account);
       refreshModelRegistry(ctx);
-      ctx.ui.notify(`Added account: ${account.label} (${account.provider})`, "info");
+      ctx.ui.notify(
+        `Added account: ${account.label} (${account.provider})`,
+        "info",
+      );
       showLoginInstructions(account, ctx);
       continue;
     }
@@ -790,7 +799,10 @@ async function openAccountPanel(
         registerAccountProvider(pi, updated);
       }
       refreshModelRegistry(ctx);
-      ctx.ui.notify(`Renamed ${account.provider} to ${nextLabel.trim()}`, "info");
+      ctx.ui.notify(
+        `Renamed ${account.provider} to ${nextLabel.trim()}`,
+        "info",
+      );
       continue;
     }
 
@@ -879,7 +891,10 @@ function registerAccountCommand(pi: ExtensionAPI): void {
         const account = addAccount(store, label);
         registerAccountProvider(pi, account);
         refreshModelRegistry(ctx);
-        ctx.ui.notify(`Added account: ${account.label} (${account.provider})`, "info");
+        ctx.ui.notify(
+          `Added account: ${account.label} (${account.provider})`,
+          "info",
+        );
         showLoginInstructions(account, ctx);
         return;
       }
