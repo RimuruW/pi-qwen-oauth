@@ -15,10 +15,6 @@
  * Use /qwen-profile to add, rename, remove, and list accounts.
  */
 
-import {
-  createAssistantMessageEventStream,
-  streamSimpleOpenAICompletions,
-} from "@mariozechner/pi-ai";
 import type {
   OAuthCredentials,
   OAuthLoginCallbacks,
@@ -795,127 +791,6 @@ function getProviderHeaders(): Record<string, string> {
   };
 }
 
-function buildStreamError(
-  providerName: string,
-  modelId: string,
-  error: unknown,
-) {
-  const errorMessage = error instanceof Error ? error.message : String(error);
-  return {
-    role: "assistant" as const,
-    content: [] as unknown[],
-    api: "openai-completions" as const,
-    provider: providerName,
-    model: modelId,
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 0,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
-    stopReason: "error" as const,
-    errorMessage,
-    timestamp: Date.now(),
-  };
-}
-
-function createNormalModeStreamSimple(providerName: string) {
-  return (
-    model: { id: string; headers?: Record<string, string> },
-    context: {
-      messages: Array<{ role: string; content: unknown }>;
-      systemPrompt?: string;
-    },
-    options?: {
-      temperature?: number;
-      maxTokens?: number;
-      reasoning?: string;
-      signal?: AbortSignal;
-      apiKey?: string;
-    },
-  ) => {
-    const wrapper = createAssistantMessageEventStream();
-    const qwenHeaders = getProviderHeaders();
-
-    const run = async (apiKey: string) => {
-      const realStream = streamSimpleOpenAICompletions(
-        model as never,
-        context as never,
-        { ...options, apiKey, headers: qwenHeaders } as never,
-      );
-      for await (const event of realStream) {
-        wrapper.push(event);
-      }
-      wrapper.end(await realStream.result());
-    };
-
-    (async () => {
-      const initialKey =
-        options?.apiKey ||
-        (getAuthEntry(providerName)?.access as string | undefined);
-
-      if (!initialKey) {
-        const errResult = buildStreamError(
-          providerName,
-          model.id,
-          new Error(`No Qwen OAuth access token for ${providerName}; run /login.`),
-        );
-        wrapper.push({ type: "error", reason: "error", error: errResult });
-        wrapper.end(errResult);
-        return;
-      }
-
-      try {
-        await run(initialKey);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (
-          message.includes("401") ||
-          message.includes("token expired") ||
-          message.includes("invalid access token")
-        ) {
-          try {
-            const currentAuth = getAuthEntry(providerName) as
-              | { refresh?: string; enterpriseUrl?: string }
-              | undefined;
-            if (!currentAuth?.refresh) {
-              throw new Error(
-                `Qwen OAuth refresh token is missing for ${providerName}; run /login again`,
-              );
-            }
-
-            const refreshed = await refreshQwenToken({
-              access: "",
-              refresh: currentAuth.refresh,
-              expires: Date.now() - 1000,
-              enterpriseUrl: currentAuth.enterpriseUrl,
-            });
-            setAuthEntry(providerName, refreshed);
-            await run(refreshed.access);
-          } catch (refreshError) {
-            const errResult = buildStreamError(
-              providerName,
-              model.id,
-              refreshError,
-            );
-            wrapper.push({ type: "error", reason: "error", error: errResult });
-            wrapper.end(errResult);
-          }
-          return;
-        }
-
-        const errResult = buildStreamError(providerName, model.id, error);
-        wrapper.push({ type: "error", reason: "error", error: errResult });
-        wrapper.end(errResult);
-      }
-    })();
-
-    return wrapper;
-  };
-}
-
 function registerAccountProvider(
   pi: ExtensionAPI,
   account: ManagedAccount,
@@ -926,7 +801,6 @@ function registerAccountProvider(
     api: "openai-completions",
     headers: getProviderHeaders(),
     models: PROVIDER_MODELS,
-    streamSimple: createNormalModeStreamSimple(account.provider),
     oauth: {
       name: getProviderOAuthName(account),
       login: loginQwen,

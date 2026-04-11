@@ -12,6 +12,7 @@ type ProviderRegistration = {
 		baseUrl: string;
 		models: Array<{ id: string; compat?: { thinkingFormat?: string } }>;
 		headers?: Record<string, string>;
+		streamSimple?: unknown;
 		oauth?: {
 			name?: string;
 			modifyModels?: (
@@ -228,6 +229,14 @@ test("adds the Qwen Portal headers required for OAuth chat completions", () => {
 		"X-DashScope-UserAgent": "QwenCode/0.14.3 (darwin; arm64)",
 		"User-Agent": "QwenCode/0.14.3 (darwin; arm64)",
 	});
+});
+
+test("uses the default openai-completions stream implementation", () => {
+	const { providers } = registerExtension();
+	const registration = providers.get("qwen-oauth");
+	if (!registration) throw new Error("Expected qwen-oauth provider");
+
+	assert.equal(registration.config.streamSimple, undefined);
 });
 
 test("normalizes coder-model payloads to include a system message with content parts", () => {
