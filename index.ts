@@ -9,12 +9,16 @@
  * pi-ai's `thinkingFormat: "qwen"` maps the TUI effort selector to this boolean
  * (off → false, any effort level → true), so thinking can be toggled on/off.
  *
- * Multi-profile mode (PI_QWEN_OAUTH_PROFILES=true):
- * Manages multiple Qwen OAuth profiles with independent credentials.
- * Use /qwen-profile to switch, login, and manage profiles.
+ * Multi-account mode (PI_QWEN_OAUTH_PROFILES=true):
+ * Registers one provider per Qwen OAuth account (`qwen-oauth`,
+ * `qwen-oauth-2`, ...) so pi sessions do not share a global active profile.
+ * Use /qwen-profile to add, rename, remove, and list accounts.
  */
 
-import { createAssistantMessageEventStream } from "@mariozechner/pi-ai";
+import {
+  createAssistantMessageEventStream,
+  streamSimpleOpenAICompletions,
+} from "@mariozechner/pi-ai";
 import type {
   OAuthCredentials,
   OAuthLoginCallbacks,
@@ -23,7 +27,6 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@mariozechner/pi-coding-agent";
-import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -41,8 +44,11 @@ const QWEN_DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code";
 const QWEN_DEFAULT_BASE_URL = "https://portal.qwen.ai/v1";
 const QWEN_DEFAULT_POLL_INTERVAL_MS = 2000;
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
-const QWEN_PORTAL_USER_AGENT = "QwenCode/0.14.0 (darwin; arm64)";
-const PROFILES_ENABLED = process.env.PI_QWEN_OAUTH_PROFILES === "true";
+const QWEN_PORTAL_USER_AGENT = "QwenCode/0.14.3 (darwin; arm64)";
+
+function profilesEnabled(): boolean {
+  return process.env.PI_QWEN_OAUTH_PROFILES === "true";
+}
 
 // ---------------------------------------------------------------------------
 // Device / Token interfaces
@@ -94,61 +100,90 @@ const MODELS: QwenModelConfig[] = [
 ];
 
 // ---------------------------------------------------------------------------
-// Profile store (multi-profile mode)
+// Account store (multi-account mode)
 // ---------------------------------------------------------------------------
 
-interface ProfileDef {
+interface ManagedAccount {
+  provider: string;
+  label: string;
+}
+
+interface AccountStoreData {
+  version: 2;
+  accounts: ManagedAccount[];
+}
+
+interface LegacyProfileDef {
   key: string;
   label: string;
 }
 
-interface ProfileCredential {
+interface LegacyProfileCredential {
   access: string;
   refresh: string;
   expires: number;
   enterpriseUrl?: string;
 }
 
-interface ProfileStoreData {
+interface LegacyProfileStoreData {
   version: number;
   activeProfile: string;
-  profiles: ProfileDef[];
-  credentials: Record<string, ProfileCredential>;
+  profiles: LegacyProfileDef[];
+  credentials: Record<string, LegacyProfileCredential>;
 }
 
 function getProfilesFilePath(): string {
   return path.join(os.homedir(), ".pi", "agent", "qwen-oauth-profiles.json");
 }
 
-function getDefaultStoreData(): ProfileStoreData {
+function getDefaultAccountStoreData(): AccountStoreData {
   return {
-    version: 1,
-    activeProfile: "default",
-    profiles: [{ key: "default", label: "Default" }],
-    credentials: {},
+    version: 2,
+    accounts: [{ provider: "qwen-oauth", label: "Default" }],
   };
 }
 
-function loadProfileStore(): ProfileStoreData {
+function readRawProfilesFile(): unknown {
   const filePath = getProfilesFilePath();
   try {
-    if (fs.existsSync(filePath)) {
-      const text = fs.readFileSync(filePath, "utf-8");
-      const parsed = JSON.parse(text) as Partial<ProfileStoreData>;
-      return {
-        ...getDefaultStoreData(),
-        ...parsed,
-        profiles: parsed.profiles ?? getDefaultStoreData().profiles,
-        credentials: parsed.credentials ?? {},
-      };
-    }
+    if (!fs.existsSync(filePath)) return undefined;
+    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
   } catch {
-    // Fall through to defaults
+    return undefined;
   }
-  return getDefaultStoreData();
 }
 
-function saveProfileStore(data: ProfileStoreData): void {
+function isManagedAccount(value: unknown): value is ManagedAccount {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    typeof (value as ManagedAccount).provider === "string" &&
+    typeof (value as ManagedAccount).label === "string"
+  );
+}
+
+function normalizeAccountStore(raw: unknown): AccountStoreData {
+  if (
+    !raw ||
+    typeof raw !== "object" ||
+    (raw as { version?: number }).version !== 2 ||
+    !Array.isArray((raw as { accounts?: unknown[] }).accounts)
+  ) {
+    return getDefaultAccountStoreData();
+  }
+
+  const accounts = (raw as { accounts: unknown[] }).accounts.filter(isManagedAccount);
+  return {
+    version: 2,
+    accounts: accounts.length > 0 ? accounts : getDefaultAccountStoreData().accounts,
+  };
+}
+
+function loadAccountStore(): AccountStoreData {
+  return normalizeAccountStore(readRawProfilesFile());
+}
+
+function saveAccountStore(data: AccountStoreData): void {
   const filePath = getProfilesFilePath();
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) {
@@ -157,138 +192,69 @@ function saveProfileStore(data: ProfileStoreData): void {
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
 }
 
-function getProfile(
-  store: ProfileStoreData,
-  key: string,
-): ProfileDef | undefined {
-  return store.profiles.find((p) => p.key === key);
+function getAccount(
+  store: AccountStoreData,
+  provider: string,
+): ManagedAccount | undefined {
+  return store.accounts.find((account) => account.provider === provider);
 }
 
-function getActiveProfile(store: ProfileStoreData): ProfileDef | undefined {
-  return getProfile(store, store.activeProfile);
+function isDefaultProvider(provider: string): boolean {
+  return provider === "qwen-oauth";
 }
 
-function getCredential(
-  store: ProfileStoreData,
-  key: string,
-): ProfileCredential | undefined {
-  return store.credentials[key];
-}
-
-function isProfileLoggedIn(store: ProfileStoreData, key: string): boolean {
-  const cred = getCredential(store, key);
-  return !!cred && cred.access && Date.now() < cred.expires;
-}
-
-function updateCredential(
-  store: ProfileStoreData,
-  key: string,
-  cred: ProfileCredential,
-): void {
-  store.credentials[key] = cred;
-  saveProfileStore(store);
-}
-
-function setActiveProfile(store: ProfileStoreData, key: string): boolean {
-  if (!getProfile(store, key)) return false;
-  store.activeProfile = key;
-  saveProfileStore(store);
-  if (PROFILES_ENABLED) {
-    syncCredentialToAuth(store);
+function getProviderOAuthName(account: ManagedAccount): string {
+  if (isDefaultProvider(account.provider) && account.label === "Default") {
+    return "Qwen OAuth";
   }
-  return true;
+  return `Qwen OAuth — ${account.label}`;
 }
 
-function removeProfile(store: ProfileStoreData, key: string): boolean {
-  if (key === "default" && store.profiles.length <= 1) return false;
-  const idx = store.profiles.findIndex((p) => p.key === key);
-  if (idx < 0) return false;
-  store.profiles.splice(idx, 1);
-  delete store.credentials[key];
-  if (store.activeProfile === key) {
-    store.activeProfile = store.profiles[0]?.key ?? "default";
+function nextAccountProviderName(store: AccountStoreData): string {
+  let index = 2;
+  const used = new Set(store.accounts.map((account) => account.provider));
+  while (used.has(`qwen-oauth-${index}`)) {
+    index++;
   }
-  saveProfileStore(store);
-  return true;
+  return `qwen-oauth-${index}`;
 }
 
-function addProfile(
-  store: ProfileStoreData,
-  key: string,
-  label?: string,
-): boolean {
-  if (getProfile(store, key)) return false;
-  store.profiles.push({ key, label: label || key });
-  saveProfileStore(store);
-  return true;
+function addAccount(
+  store: AccountStoreData,
+  label: string,
+): ManagedAccount {
+  const account: ManagedAccount = {
+    provider: nextAccountProviderName(store),
+    label,
+  };
+  store.accounts.push(account);
+  saveAccountStore(store);
+  return account;
 }
 
-function renameProfileLabel(
-  store: ProfileStoreData,
-  key: string,
+function renameAccountLabel(
+  store: AccountStoreData,
+  provider: string,
   label: string,
 ): boolean {
-  const profile = getProfile(store, key);
-  if (!profile) return false;
-  profile.label = label;
-  saveProfileStore(store);
+  const account = getAccount(store, provider);
+  if (!account) return false;
+  account.label = label;
+  saveAccountStore(store);
+  return true;
+}
+
+function removeAccount(store: AccountStoreData, provider: string): boolean {
+  if (isDefaultProvider(provider)) return false;
+  const index = store.accounts.findIndex((account) => account.provider === provider);
+  if (index < 0) return false;
+  store.accounts.splice(index, 1);
+  saveAccountStore(store);
   return true;
 }
 
 // ---------------------------------------------------------------------------
-// Migration: import old auth.json credentials into default profile
-// ---------------------------------------------------------------------------
-
-function migrateOldCredentials(store: ProfileStoreData): {
-  migrated: boolean;
-  loggedIn: boolean;
-} {
-  // Only migrate if default profile has no credentials yet
-  if (
-    isProfileLoggedIn(store, "default") ||
-    store.credentials["default"]?.refresh
-  ) {
-    return { migrated: false, loggedIn: false };
-  }
-
-  // Try to read pi's auth.json
-  const authPath = path.join(os.homedir(), ".pi", "agent", "auth.json");
-  try {
-    if (!fs.existsSync(authPath)) return { migrated: false, loggedIn: false };
-    const text = fs.readFileSync(authPath, "utf-8");
-    const auth = JSON.parse(text) as Record<string, unknown>;
-    const qwenCred = auth["qwen-oauth"];
-    if (
-      !qwenCred ||
-      typeof qwenCred !== "object" ||
-      (qwenCred as Record<string, unknown>).type !== "oauth"
-    ) {
-      return { migrated: false, loggedIn: false };
-    }
-    const oauth = qwenCred as Record<string, unknown>;
-    const access = oauth.access as string | undefined;
-    const refresh = oauth.refresh as string | undefined;
-    const expires = oauth.expires as number | undefined;
-    if (!access || !refresh || !expires)
-      return { migrated: false, loggedIn: false };
-
-    const loggedIn = Date.now() < expires;
-
-    store.credentials["default"] = {
-      access,
-      refresh,
-      expires,
-      enterpriseUrl: oauth.enterpriseUrl as string | undefined,
-    };
-    saveProfileStore(store);
-    return { migrated: true, loggedIn };
-  } catch {
-    return { migrated: false, loggedIn: false };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// auth.json sync helpers (profile mode)
+// auth.json helpers
 // ---------------------------------------------------------------------------
 
 function getAuthJsonPath(): string {
@@ -319,58 +285,146 @@ function writeAuthJson(data: Record<string, unknown>): void {
   fs.writeFileSync(authPath, JSON.stringify(data, null, 2), "utf-8");
 }
 
-/**
- * Sync active profile's credentials to auth.json so the framework sees
- * qwen-oauth as "logged in" (hasAuth returns true, /login and /logout work).
- */
-function syncCredentialToAuth(store: ProfileStoreData): void {
-  const active = getActiveProfile(store);
-  if (!active) return;
+function getAuthEntry(provider: string): Record<string, unknown> | undefined {
+  const entry = readAuthJson()[provider];
+  if (!entry || typeof entry !== "object") return undefined;
+  return entry as Record<string, unknown>;
+}
 
-  const cred = getCredential(store, active.key);
-  if (!cred || !cred.access || !cred.refresh) return;
-
+function setAuthEntry(
+  provider: string,
+  credentials: OAuthCredentials,
+): void {
   const authData = readAuthJson();
-  const existing = authData["qwen-oauth"];
-
-  // Skip if auth.json already has the same access token (no-op)
-  if (
-    existing &&
-    typeof existing === "object" &&
-    (existing as Record<string, unknown>).access === cred.access
-  ) {
-    return;
-  }
-
-  authData["qwen-oauth"] = {
+  authData[provider] = {
     type: "oauth",
-    access: cred.access,
-    refresh: cred.refresh,
-    expires: cred.expires,
-    enterpriseUrl: cred.enterpriseUrl,
+    access: credentials.access,
+    refresh: credentials.refresh,
+    expires: credentials.expires,
+    enterpriseUrl: credentials.enterpriseUrl,
   };
   writeAuthJson(authData);
 }
 
-/**
- * Detect if /logout qwen-oauth was called by checking whether auth.json
- * no longer has a qwen-oauth entry while the vault still does.
- * If so, clear the active profile's credentials from the vault.
- * Returns true if a logout was detected and cleaned up.
- */
-function syncLogoutState(store: ProfileStoreData): boolean {
-  const active = getActiveProfile(store);
-  if (!active) return false;
-
-  const cred = getCredential(store, active.key);
-  if (!cred) return false;
-
+function removeAuthEntry(provider: string): void {
   const authData = readAuthJson();
-  if (authData["qwen-oauth"]) return false;
+  if (!(provider in authData)) return;
+  delete authData[provider];
+  writeAuthJson(authData);
+}
 
-  // auth.json has no qwen-oauth entry, but vault does → logout detected
-  delete store.credentials[active.key];
-  saveProfileStore(store);
+type ProviderAuthState = "logged-in" | "refreshable" | "logged-out";
+
+function getProviderAuthState(provider: string): ProviderAuthState {
+  const entry = getAuthEntry(provider);
+  if (!entry) return "logged-out";
+
+  const access = entry.access;
+  const refresh = entry.refresh;
+  const expires = entry.expires;
+  if (typeof access !== "string" || access.length === 0) {
+    return typeof refresh === "string" && refresh.length > 0
+      ? "refreshable"
+      : "logged-out";
+  }
+  if (typeof expires !== "number" || Date.now() < expires) {
+    return "logged-in";
+  }
+  return typeof refresh === "string" && refresh.length > 0
+    ? "refreshable"
+    : "logged-out";
+}
+
+function getProviderStatusLabel(provider: string): string {
+  const state = getProviderAuthState(provider);
+  if (state === "logged-in") return "logged in";
+  if (state === "refreshable") {
+    return "token expired — will refresh on next request";
+  }
+  return "not logged in";
+}
+
+// ---------------------------------------------------------------------------
+// Legacy profile-store migration
+// ---------------------------------------------------------------------------
+
+function isLegacyProfileStore(raw: unknown): raw is LegacyProfileStoreData {
+  return (
+    !!raw &&
+    typeof raw === "object" &&
+    Array.isArray((raw as LegacyProfileStoreData).profiles) &&
+    !!(raw as LegacyProfileStoreData).credentials &&
+    typeof (raw as LegacyProfileStoreData).credentials === "object"
+  );
+}
+
+function migrateLegacyProfileStore(): {
+  migrated: boolean;
+  store: AccountStoreData;
+} {
+  const raw = readRawProfilesFile();
+  if (!isLegacyProfileStore(raw)) {
+    return { migrated: false, store: loadAccountStore() };
+  }
+
+  const profiles = raw.profiles.filter(
+    (profile): profile is LegacyProfileDef =>
+      !!profile &&
+      typeof profile === "object" &&
+      typeof profile.key === "string" &&
+      typeof profile.label === "string",
+  );
+
+  const orderedProfiles = [
+    ...profiles.filter((profile) => profile.key === raw.activeProfile),
+    ...profiles.filter((profile) => profile.key !== raw.activeProfile),
+  ];
+
+  const accounts = orderedProfiles.map((profile, index) => ({
+    provider: index === 0 ? "qwen-oauth" : `qwen-oauth-${index + 1}`,
+    label: profile.label,
+  }));
+  const store: AccountStoreData = {
+    version: 2,
+    accounts: accounts.length > 0 ? accounts : getDefaultAccountStoreData().accounts,
+  };
+
+  for (const [index, profile] of orderedProfiles.entries()) {
+    const credentials = raw.credentials[profile.key];
+    if (!credentials?.access) continue;
+    setAuthEntry(index === 0 ? "qwen-oauth" : `qwen-oauth-${index + 1}`, {
+      access: credentials.access,
+      refresh: credentials.refresh || "",
+      expires: credentials.expires,
+      enterpriseUrl: credentials.enterpriseUrl,
+    });
+  }
+
+  saveAccountStore(store);
+  return { migrated: true, store };
+}
+
+function syncLegacyActiveProfileToBaseProvider(): boolean {
+  const raw = readRawProfilesFile();
+  if (!isLegacyProfileStore(raw)) return false;
+
+  const activeProfile = raw.profiles.find(
+    (profile) => profile.key === raw.activeProfile,
+  );
+  if (!activeProfile) return false;
+
+  const credentials = raw.credentials[activeProfile.key];
+  if (!credentials?.access) return false;
+
+  const existing = getAuthEntry("qwen-oauth");
+  if (existing?.access) return false;
+
+  setAuthEntry("qwen-oauth", {
+    access: credentials.access,
+    refresh: credentials.refresh || "",
+    expires: credentials.expires,
+    enterpriseUrl: credentials.enterpriseUrl,
+  });
   return true;
 }
 
@@ -405,50 +459,6 @@ function toBase64Url(bytes: Uint8Array): string {
 // ---------------------------------------------------------------------------
 // Base URL normalization
 // ---------------------------------------------------------------------------
-
-function openBrowser(url: string): void {
-  const openCmd =
-    process.platform === "darwin"
-      ? "open"
-      : process.platform === "win32"
-        ? "cmd"
-        : "xdg-open";
-  // Use execFile to avoid shell injection; on Windows cmd needs /c prefix
-  const args = openCmd === "cmd" ? ["/c", "start", url] : [url];
-  execFile(openCmd, args);
-}
-
-// ---------------------------------------------------------------------------
-// Interactive login helper (shared across commands and TUI panel)
-// ---------------------------------------------------------------------------
-
-async function interactiveLogin(
-  store: ProfileStoreData,
-  profileKey: string,
-  label: string,
-  ctx: ExtensionContext,
-): Promise<void> {
-  ctx.ui.notify(`Starting login for ${label}…`, "info");
-  try {
-    await loginProfile(store, profileKey, {
-      onAuth: ({ url }) => {
-        openBrowser(url);
-        ctx.ui.notify(
-          `Opened browser. If login didn't complete, visit: ${url}`,
-          "info",
-        );
-      },
-      onPrompt: async ({ message }) => (await ctx.ui.input(message)) || "",
-      signal: ctx.signal,
-    });
-    ctx.ui.notify(`Logged in to ${label}`, "info");
-  } catch (error) {
-    ctx.ui.notify(
-      `Login failed for ${label}: ${error instanceof Error ? error.message : String(error)}`,
-      "error",
-    );
-  }
-}
 
 function normalizeBaseUrl(resourceUrl?: string): string {
   if (!resourceUrl) {
@@ -759,870 +769,9 @@ export async function refreshQwenToken(
 }
 
 // ---------------------------------------------------------------------------
-// Profile-mode login/refresh
-// ---------------------------------------------------------------------------
-
-async function loginProfile(
-  store: ProfileStoreData,
-  profileKey: string,
-  callbacks: OAuthLoginCallbacks,
-): Promise<OAuthCredentials> {
-  const { device, verifier } = await startDeviceFlow(callbacks.signal);
-  const authUrl = device.verification_uri_complete || device.verification_uri;
-  const instructions = device.verification_uri_complete
-    ? undefined
-    : `Enter code: ${device.user_code}`;
-
-  callbacks.onAuth({ url: authUrl, instructions });
-
-  const token = await pollForToken(
-    device.device_code,
-    verifier,
-    device.interval,
-    device.expires_in,
-    callbacks.signal,
-    callbacks.onProgress,
-  );
-
-  const cred: ProfileCredential = {
-    access: token.access_token,
-    refresh: token.refresh_token || "",
-    expires: computeExpiry(token.expires_in),
-    enterpriseUrl: token.resource_url,
-  };
-  updateCredential(store, profileKey, cred);
-
-  return {
-    refresh: cred.refresh,
-    access: cred.access,
-    expires: cred.expires,
-    enterpriseUrl: cred.enterpriseUrl,
-  };
-}
-
-async function refreshProfileCredential(
-  store: ProfileStoreData,
-  profileKey: string,
-): Promise<ProfileCredential> {
-  const existing = getCredential(store, profileKey);
-  if (!existing?.refresh) {
-    throw new Error(
-      `Profile "${profileKey}" has no refresh token; run /qwen-profile login ${profileKey}`,
-    );
-  }
-
-  const response = await fetch(QWEN_TOKEN_ENDPOINT, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      Accept: "application/json",
-    },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: existing.refresh,
-      client_id: QWEN_CLIENT_ID,
-    }).toString(),
-  });
-
-  if (!response.ok) {
-    throw new Error(
-      `Qwen token refresh failed for profile "${profileKey}": ${response.status} ${await response.text()}`,
-    );
-  }
-
-  const token = (await response.json()) as TokenResponse;
-  if (!token.access_token) {
-    throw new Error(
-      `Qwen refresh response for profile "${profileKey}" did not include an access token`,
-    );
-  }
-
-  const cred: ProfileCredential = {
-    access: token.access_token,
-    refresh: token.refresh_token || existing.refresh,
-    expires: computeExpiry(token.expires_in),
-    enterpriseUrl: token.resource_url ?? existing.enterpriseUrl,
-  };
-  updateCredential(store, profileKey, cred);
-  return cred;
-}
-
-// ---------------------------------------------------------------------------
-// Profile-mode: ensure valid token (refresh if needed)
-// ---------------------------------------------------------------------------
-
-async function ensureValidProfileToken(
-  store: ProfileStoreData,
-  profileKey: string,
-): Promise<ProfileCredential> {
-  const cred = getCredential(store, profileKey);
-  if (!cred || !cred.access) {
-    throw new Error(
-      `Profile "${profileKey}" is not logged in. Run /qwen-profile login ${profileKey} or /login qwen-oauth.`,
-    );
-  }
-
-  // Token still valid?
-  if (Date.now() < cred.expires) {
-    return cred;
-  }
-
-  // Needs refresh
-  return refreshProfileCredential(store, profileKey);
-}
-
-// ---------------------------------------------------------------------------
-// Profile-mode: custom streamSimple
-//
-// We can't delegate to pi-ai's streamSimpleOpenAICompletions (not exported).
-// Instead, we build the request, fetch Qwen Portal, parse SSE, and emit
-// events via createAssistantMessageEventStream.
-// ---------------------------------------------------------------------------
-
-function buildOpenAIMessages(context: {
-  messages: Array<{
-    role: string;
-    content: unknown;
-    toolCallId?: string;
-    toolName?: string;
-  }>;
-}): Array<Record<string, unknown>> {
-  const messages: Array<Record<string, unknown>> = [];
-  for (const msg of context.messages) {
-    if (msg.role === "toolResult") {
-      messages.push({
-        role: "tool",
-        tool_call_id: msg.toolCallId,
-        content:
-          typeof msg.content === "string"
-            ? msg.content
-            : JSON.stringify(msg.content),
-      });
-    } else if (msg.role === "assistant") {
-      const textParts: string[] = [];
-      const toolCalls: Array<Record<string, unknown>> = [];
-      if (Array.isArray(msg.content)) {
-        for (const block of msg.content) {
-          if (block && typeof block === "object") {
-            const b = block as Record<string, unknown>;
-            if (
-              b.type === "text" &&
-              typeof b.text === "string" &&
-              b.text.trim().length > 0
-            ) {
-              textParts.push(b.text);
-            } else if (b.type === "toolCall") {
-              toolCalls.push({
-                id: (b.id as string) || "",
-                type: "function",
-                function: {
-                  name: (b.name as string) || "",
-                  arguments:
-                    typeof b.arguments === "object"
-                      ? JSON.stringify(b.arguments)
-                      : (b.arguments as string) || "{}",
-                },
-              });
-            }
-          }
-        }
-      }
-      const assistantMsg: Record<string, unknown> = { role: "assistant" };
-      // OpenAI Chat Completions standard: assistant content is a plain string
-      if (textParts.length > 0) assistantMsg.content = textParts.join("");
-      if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
-      // Skip assistant messages with no content and no tool calls
-      if (assistantMsg.content === undefined && !assistantMsg.tool_calls)
-        continue;
-      messages.push(assistantMsg);
-    } else if (msg.role === "system") {
-      // System messages: normalize content to content-parts array
-      messages.push({
-        role: "system",
-        content: normalizeQwenSystemContent(msg.content),
-      });
-    } else {
-      // user: keep content as-is (OpenAI SDK sends user content as array of parts)
-      // Qwen Portal expects the same format — collapsing to string causes 400
-      messages.push({
-        role: "user",
-        content: msg.content,
-      });
-    }
-  }
-  return messages;
-}
-
-function buildRequestPayload(
-  modelId: string,
-  context: {
-    messages: Array<{ role: string; content: unknown }>;
-    systemPrompt?: string;
-  },
-  options?: { temperature?: number; maxTokens?: number; reasoning?: string },
-): Record<string, unknown> {
-  const messages = buildOpenAIMessages(context);
-
-  // If there's a systemPrompt and no system message in the conversation, prepend it
-  const hasSystem = messages.some((m) => m.role === "system");
-  if (context.systemPrompt && !hasSystem) {
-    messages.unshift({ role: "system", content: context.systemPrompt });
-  }
-
-  const payload: Record<string, unknown> = {
-    model: modelId,
-    messages,
-    stream: true,
-  };
-
-  if (options?.temperature !== undefined)
-    payload.temperature = options.temperature;
-  if (options?.maxTokens !== undefined) payload.max_tokens = options.maxTokens;
-
-  // Qwen Portal: enable_thinking as boolean for reasoning models
-  // Must always be set (true/false) — omitting it causes 400 invalid_parameter_error
-  const modelDef = MODELS.find((m) => m.id === modelId);
-  if (modelDef?.reasoning) {
-    payload.enable_thinking =
-      !!options?.reasoning && options.reasoning !== "off";
-  }
-
-  return payload;
-}
-
-function createQwenStream(
-  modelId: string,
-  baseUrl: string,
-  headers: Record<string, string> | undefined,
-  context: {
-    messages: Array<{ role: string; content: unknown }>;
-    systemPrompt?: string;
-  },
-  token: string,
-  options?: {
-    temperature?: number;
-    maxTokens?: number;
-    reasoning?: string;
-    signal?: AbortSignal;
-  },
-) {
-  const stream = createAssistantMessageEventStream();
-
-  const output = {
-    role: "assistant" as const,
-    content: [] as Array<{
-      type: string;
-      text?: string;
-      thinking?: string;
-      id?: string;
-      name?: string;
-      arguments?: Record<string, unknown>;
-    }>,
-    api: "openai-completions" as const,
-    provider: "qwen-oauth",
-    model: modelId,
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 0,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
-    stopReason: "stop" as const,
-    timestamp: Date.now(),
-  };
-
-  (async () => {
-    try {
-      const rawPayload = buildRequestPayload(modelId, context, options);
-      const payload = normalizeQwenPortalPayload(rawPayload) as Record<
-        string,
-        unknown
-      >;
-
-      const requestHeaders: Record<string, string> = {
-        "Content-Type": "application/json",
-        Accept: "text/event-stream",
-        Authorization: `Bearer ${token}`,
-      };
-      if (headers) {
-        for (const [k, v] of Object.entries(headers)) {
-          requestHeaders[k] = v;
-        }
-      }
-
-      const response = await fetch(`${baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: requestHeaders,
-        body: JSON.stringify(payload),
-        signal: options?.signal,
-      });
-
-      if (!response.ok) {
-        const body = await response.text();
-        throw new Error(`Qwen API error: ${response.status} ${body}`);
-      }
-
-      if (!response.body) {
-        throw new Error("Qwen API response body is null");
-      }
-
-      stream.push({
-        type: "start",
-        partial: { ...output, content: [...output.content] },
-      });
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let textContentIndex = -1;
-      let thinkingContentIndex = -1;
-      let currentToolCallIndex = -1;
-      let currentToolCall: {
-        id: string;
-        name: string;
-        arguments: string;
-      } | null = null;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith(":")) continue;
-
-          if (!trimmed.startsWith("data: ")) continue;
-          const data = trimmed.slice(6);
-          if (data === "[DONE]") {
-            stream.push({
-              type: "done",
-              reason: output.stopReason as "stop" | "length" | "toolUse",
-              message: { ...output, content: [...output.content] },
-            });
-            stream.end({ ...output, content: [...output.content] });
-            return;
-          }
-
-          let chunk: Record<string, unknown>;
-          try {
-            chunk = JSON.parse(data) as Record<string, unknown>;
-          } catch {
-            continue;
-          }
-
-          const choices = chunk.choices as
-            | Array<Record<string, unknown>>
-            | undefined;
-          if (!choices || choices.length === 0) continue;
-
-          const delta = choices[0]?.delta as
-            | Record<string, unknown>
-            | undefined;
-          if (!delta) continue;
-
-          const finishReason = choices[0]?.finish_reason as string | undefined;
-          if (finishReason) {
-            if (finishReason === "stop") output.stopReason = "stop";
-            else if (finishReason === "length") output.stopReason = "length";
-            else if (finishReason === "tool_calls")
-              output.stopReason = "toolUse";
-          }
-
-          // Usage (sometimes in the last chunk)
-          const usage = chunk.usage as Record<string, number> | undefined;
-          if (usage) {
-            output.usage.input = usage.prompt_tokens ?? output.usage.input;
-            output.usage.output =
-              usage.completion_tokens ?? output.usage.output;
-            output.usage.cacheRead = usage.prompt_tokens_details?.cached_tokens
-              ? 0
-              : (usage.cache_read_tokens ?? 0);
-            output.usage.cacheWrite = usage.cache_write_tokens ?? 0;
-            output.usage.totalTokens =
-              output.usage.input +
-              output.usage.output +
-              output.usage.cacheRead +
-              output.usage.cacheWrite;
-          }
-
-          // Text content
-          if (typeof delta.content === "string" && delta.content) {
-            if (
-              textContentIndex < 0 ||
-              output.content[textContentIndex]?.type !== "text"
-            ) {
-              output.content.push({ type: "text", text: "" });
-              textContentIndex = output.content.length - 1;
-              stream.push({
-                type: "text_start",
-                contentIndex: textContentIndex,
-                partial: { ...output, content: [...output.content] },
-              });
-            }
-            const textBlock = output.content[textContentIndex];
-            if (textBlock && textBlock.type === "text") {
-              textBlock.text += delta.content;
-              stream.push({
-                type: "text_delta",
-                contentIndex: textContentIndex,
-                delta: delta.content as string,
-                partial: { ...output, content: [...output.content] },
-              });
-            }
-          }
-
-          // Thinking content (Qwen-style: delta.reasoning_content or delta.reasoning)
-          const thinkingDelta =
-            (delta.reasoning_content as string) || (delta.reasoning as string);
-          if (thinkingDelta) {
-            if (
-              thinkingContentIndex < 0 ||
-              output.content[thinkingContentIndex]?.type !== "thinking"
-            ) {
-              output.content.push({ type: "thinking", thinking: "" });
-              thinkingContentIndex = output.content.length - 1;
-              stream.push({
-                type: "thinking_start",
-                contentIndex: thinkingContentIndex,
-                partial: { ...output, content: [...output.content] },
-              });
-            }
-            const thinkingBlock = output.content[thinkingContentIndex];
-            if (thinkingBlock && thinkingBlock.type === "thinking") {
-              thinkingBlock.thinking += thinkingDelta;
-              stream.push({
-                type: "thinking_delta",
-                contentIndex: thinkingContentIndex,
-                delta: thinkingDelta,
-                partial: { ...output, content: [...output.content] },
-              });
-            }
-          }
-
-          // Tool calls
-          const toolCalls = delta.tool_calls as
-            | Array<Record<string, unknown>>
-            | undefined;
-          if (toolCalls) {
-            for (const tc of toolCalls) {
-              const index = tc.index as number | undefined;
-              if (index !== undefined && index !== currentToolCallIndex) {
-                // End previous tool call
-                if (currentToolCall && currentToolCallIndex >= 0) {
-                  const prevBlock = output.content[currentToolCallIndex];
-                  if (prevBlock && prevBlock.type === "toolCall") {
-                    try {
-                      prevBlock.arguments = JSON.parse(
-                        currentToolCall.arguments,
-                      );
-                    } catch {
-                      prevBlock.arguments = {};
-                    }
-                    stream.push({
-                      type: "toolcall_end",
-                      contentIndex: currentToolCallIndex,
-                      toolCall: {
-                        type: "toolCall",
-                        id: currentToolCall.id,
-                        name: currentToolCall.name,
-                        arguments: prevBlock.arguments as Record<
-                          string,
-                          unknown
-                        >,
-                      },
-                      partial: { ...output, content: [...output.content] },
-                    });
-                  }
-                }
-
-                // Start new tool call
-                const id = (tc.id as string) || currentToolCall?.id || "";
-                const fn = tc.function as Record<string, unknown> | undefined;
-                const name = (fn?.name as string) || "";
-                const args = (fn?.arguments as string) || "";
-                output.content.push({
-                  type: "toolCall",
-                  id,
-                  name,
-                  arguments: {} as Record<string, unknown>,
-                });
-                currentToolCallIndex = output.content.length - 1;
-                currentToolCall = { id, name, arguments: args };
-
-                stream.push({
-                  type: "toolcall_start",
-                  contentIndex: currentToolCallIndex,
-                  partial: { ...output, content: [...output.content] },
-                });
-              } else if (currentToolCall) {
-                const fn = tc.function as Record<string, unknown> | undefined;
-                if (fn?.arguments) {
-                  currentToolCall.arguments += fn.arguments as string;
-                  const block = output.content[currentToolCallIndex];
-                  if (block) {
-                    stream.push({
-                      type: "toolcall_delta",
-                      contentIndex: currentToolCallIndex,
-                      delta: fn.arguments as string,
-                      partial: { ...output, content: [...output.content] },
-                    });
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-
-      // End any in-progress tool call
-      if (currentToolCall && currentToolCallIndex >= 0) {
-        const block = output.content[currentToolCallIndex];
-        if (block && block.type === "toolCall") {
-          try {
-            block.arguments = JSON.parse(currentToolCall.arguments);
-          } catch {
-            block.arguments = {};
-          }
-          stream.push({
-            type: "toolcall_end",
-            contentIndex: currentToolCallIndex,
-            toolCall: {
-              type: "toolCall",
-              id: currentToolCall.id,
-              name: currentToolCall.name,
-              arguments: block.arguments as Record<string, unknown>,
-            },
-            partial: { ...output, content: [...output.content] },
-          });
-        }
-      }
-
-      // End text block if open
-      const lastBlock = output.content[output.content.length - 1];
-      if (lastBlock?.type === "text") {
-        stream.push({
-          type: "text_end",
-          contentIndex: output.content.length - 1,
-          content: lastBlock.text || "",
-          partial: { ...output, content: [...output.content] },
-        });
-      } else if (lastBlock?.type === "thinking") {
-        stream.push({
-          type: "thinking_end",
-          contentIndex: output.content.length - 1,
-          content: lastBlock.thinking || "",
-          partial: { ...output, content: [...output.content] },
-        });
-      }
-
-      stream.push({
-        type: "done",
-        reason: output.stopReason as "stop" | "length" | "toolUse",
-        message: { ...output, content: [...output.content] },
-      });
-      stream.end({ ...output, content: [...output.content] });
-    } catch (error) {
-      output.stopReason = options?.signal?.aborted
-        ? ("aborted" as const)
-        : ("error" as const);
-      output.errorMessage =
-        error instanceof Error ? error.message : String(error);
-      stream.push({
-        type: "error",
-        reason: output.stopReason,
-        error: { ...output, content: [...output.content] },
-      });
-      stream.end({ ...output, content: [...output.content] });
-    }
-  })();
-
-  return stream;
-}
-
-// ---------------------------------------------------------------------------
-// /qwen-profile command (profiles mode only)
-// ---------------------------------------------------------------------------
-
-function registerProfileCommand(
-  pi: ExtensionAPI,
-  store: ProfileStoreData,
-): void {
-  pi.registerCommand("qwen-profile", {
-    description: "Manage Qwen OAuth profiles",
-    getArgumentCompletions: (prefix: string) => {
-      const trimmed = prefix.trim();
-      if (!trimmed) {
-        return ["use", "login", "add", "rename", "remove", "list"].map((v) => ({
-          value: v,
-          label: v,
-        }));
-      }
-      const parts = trimmed.split(/\s+/);
-      if (parts.length === 1) {
-        const matches = [
-          "use",
-          "login",
-          "add",
-          "rename",
-          "remove",
-          "list",
-        ].filter((v) => v.startsWith(parts[0]));
-        return matches.length > 0
-          ? matches.map((v) => ({ value: v, label: v }))
-          : null;
-      }
-      if (
-        parts[0] === "use" ||
-        parts[0] === "login" ||
-        parts[0] === "rename" ||
-        parts[0] === "remove"
-      ) {
-        const profilePrefix = parts[1] || "";
-        const matches = store.profiles
-          .map((p) => p.key)
-          .filter((k) => k.startsWith(profilePrefix));
-        return matches.length > 0
-          ? matches.map((k) => ({ value: `${parts[0]} ${k}`, label: k }))
-          : null;
-      }
-      return null;
-    },
-    handler: async (args: string, ctx) => {
-      if (!ctx.hasUI) {
-        // Non-interactive mode: print status
-        const active = store.activeProfile;
-        const lines = store.profiles.map((p) => {
-          const loggedIn = isProfileLoggedIn(store, p.key);
-          const activeMarker = p.key === active ? " [active]" : "";
-          return `${p.label} (${p.key})${activeMarker} - ${loggedIn ? "logged in" : "not logged in"}`;
-        });
-        ctx.ui.notify(lines.join("\n"), "info");
-        return;
-      }
-
-      const trimmed = args.trim();
-      if (!trimmed) {
-        await openProfilePanel(ctx, store);
-        return;
-      }
-
-      const parts = trimmed.split(/\s+/);
-      const subcommand = parts[0]?.toLowerCase();
-
-      if (subcommand === "list") {
-        const active = store.activeProfile;
-        const lines = store.profiles.map((p) => {
-          const loggedIn = isProfileLoggedIn(store, p.key);
-          const activeMarker = p.key === active ? " [active]" : "";
-          return `${p.label} (${p.key})${activeMarker} - ${loggedIn ? "logged in" : "not logged in"}`;
-        });
-        ctx.ui.notify(lines.join("\n"), "info");
-        return;
-      }
-
-      if (subcommand === "use" && parts[1]) {
-        const key = parts[1];
-        if (!getProfile(store, key)) {
-          ctx.ui.notify(`Unknown profile: ${key}`, "error");
-          return;
-        }
-        setActiveProfile(store, key);
-        ctx.ui.notify(
-          `Switched to profile: ${getProfile(store, key)?.label || key}`,
-          "info",
-        );
-        return;
-      }
-
-      if (subcommand === "login" && parts[1]) {
-        const key = parts[1];
-        const profile = getProfile(store, key);
-        if (!profile) {
-          ctx.ui.notify(`Unknown profile: ${key}`, "error");
-          return;
-        }
-        try {
-          await interactiveLogin(store, key, profile.label, ctx);
-        } catch {
-          // Error already handled by interactiveLogin
-        }
-        return;
-      }
-
-      if (subcommand === "add" && parts[1]) {
-        const key = parts[1];
-        const label = parts.slice(2).join(" ") || key;
-        if (addProfile(store, key, label)) {
-          ctx.ui.notify(`Added profile: ${label} (${key})`, "info");
-          // Prompt to login
-          const doLogin = await ctx.ui.confirm(
-            `Login to ${label}`,
-            `Start the OAuth device flow for ${label}?`,
-          );
-          if (doLogin) {
-            await interactiveLogin(store, key, label, ctx);
-          }
-        } else {
-          ctx.ui.notify(`Profile "${key}" already exists`, "warning");
-        }
-        return;
-      }
-
-      if (subcommand === "rename" && parts[1] && parts[2]) {
-        const key = parts[1];
-        const newLabel = parts.slice(2).join(" ");
-        if (renameProfileLabel(store, key, newLabel)) {
-          ctx.ui.notify(`Renamed ${key} to: ${newLabel}`, "info");
-        } else {
-          ctx.ui.notify(`Profile "${key}" not found`, "error");
-        }
-        return;
-      }
-
-      if (subcommand === "remove" && parts[1]) {
-        const key = parts[1];
-        if (key === "default" && store.profiles.length <= 1) {
-          ctx.ui.notify("Cannot remove the last profile", "warning");
-          return;
-        }
-        if (removeProfile(store, key)) {
-          ctx.ui.notify(`Removed profile: ${key}`, "info");
-        } else {
-          ctx.ui.notify(`Profile "${key}" not found`, "error");
-        }
-        return;
-      }
-
-      ctx.ui.notify(
-        "Usage: /qwen-profile [list | use <key> | login <key> | add <key> [label] | rename <key> <label> | remove <key>]",
-        "info",
-      );
-    },
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Profile management TUI panel
-// ---------------------------------------------------------------------------
-
-async function openProfilePanel(
-  ctx: ExtensionContext,
-  store: ProfileStoreData,
-): Promise<void> {
-  while (true) {
-    const profiles = store.profiles;
-    const active = store.activeProfile;
-
-    const options = profiles.map((p) => {
-      const loggedIn = isProfileLoggedIn(store, p.key);
-      const activeMarker = p.key === active ? " ✓" : "";
-      const status = loggedIn ? "logged in" : "not logged in";
-      return `${p.label}${activeMarker}  [${p.key}]  ${status}`;
-    });
-
-    const menuOptions = [...options, "───", "Add new profile"];
-    const selected = await ctx.ui.select("Qwen OAuth Profiles", menuOptions);
-    if (!selected) return;
-
-    // Check if user selected "Add new profile"
-    if (selected === "Add new profile") {
-      const key = await ctx.ui.input("Profile key (e.g. work, personal):");
-      if (!key?.trim()) continue;
-      if (getProfile(store, key.trim())) {
-        ctx.ui.notify(`Profile "${key.trim()}" already exists`, "warning");
-        continue;
-      }
-      const label = await ctx.ui.input("Display label:", key.trim());
-      addProfile(store, key.trim(), label?.trim() || key.trim());
-      ctx.ui.notify(
-        `Added profile: ${label?.trim() || key.trim()} (${key.trim()})`,
-        "info",
-      );
-      // Prompt to login
-      const name = label?.trim() || key.trim();
-      const doLogin = await ctx.ui.confirm(
-        `Login to ${name}`,
-        `Start the OAuth device flow for ${name}?`,
-      );
-      if (doLogin) {
-        await interactiveLogin(
-          store,
-          key.trim(),
-          label?.trim() || key.trim(),
-          ctx,
-        );
-      }
-      continue;
-    }
-
-    // Skip separator
-    if (selected === "───") continue;
-
-    // Find which profile was selected (match by key in the display)
-    const selectedIndex = options.indexOf(selected);
-    const profile = profiles[selectedIndex];
-    if (!profile) continue;
-
-    // Action panel for selected profile
-    const actions = [
-      profile.key === active ? `Currently active` : `Switch to this profile`,
-      isProfileLoggedIn(store, profile.key) ? `Refresh token` : `Login`,
-      `Rename label`,
-      profile.key !== "default" ? `Remove profile` : null,
-    ].filter(Boolean) as string[];
-
-    const action = await ctx.ui.select(
-      `${profile.label} (${profile.key})`,
-      actions,
-    );
-    if (!action) continue;
-
-    if (action.includes("Switch") || action.includes("active")) {
-      setActiveProfile(store, profile.key);
-      ctx.ui.notify(`Switched to profile: ${profile.label}`, "info");
-      continue;
-    }
-
-    if (action.includes("Refresh") || action.includes("Login")) {
-      await interactiveLogin(store, profile.key, profile.label, ctx);
-      continue;
-    }
-
-    if (action.includes("Rename")) {
-      const newLabel = await ctx.ui.input("New label:", profile.label);
-      if (newLabel?.trim()) {
-        renameProfileLabel(store, profile.key, newLabel.trim());
-        ctx.ui.notify(`Renamed to: ${newLabel.trim()}`, "info");
-      }
-      continue;
-    }
-
-    if (action.includes("Remove")) {
-      const confirmed = await ctx.ui.confirm(
-        `Remove profile "${profile.label}"?`,
-        "This will delete its credentials.",
-      );
-      if (confirmed) {
-        removeProfile(store, profile.key);
-        ctx.ui.notify(`Removed profile: ${profile.label}`, "info");
-      }
-      continue;
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Provider registration
 // ---------------------------------------------------------------------------
 
-/** Shared model definitions used by both normal and profile modes. */
 const PROVIDER_MODELS = MODELS.map((model) => ({
   id: model.id,
   name: model.name,
@@ -1638,14 +787,25 @@ const PROVIDER_MODELS = MODELS.map((model) => ({
   },
 }));
 
-/** Build a streamSimple error result for profile mode. */
-function buildStreamError(modelId: string, error: unknown) {
+function getProviderHeaders(): Record<string, string> {
+  return {
+    "X-DashScope-AuthType": "qwen-oauth",
+    "X-DashScope-UserAgent": QWEN_PORTAL_USER_AGENT,
+    "User-Agent": QWEN_PORTAL_USER_AGENT,
+  };
+}
+
+function buildStreamError(
+  providerName: string,
+  modelId: string,
+  error: unknown,
+) {
   const errorMessage = error instanceof Error ? error.message : String(error);
   return {
     role: "assistant" as const,
     content: [] as unknown[],
     api: "openai-completions" as const,
-    provider: "qwen-oauth",
+    provider: providerName,
     model: modelId,
     usage: {
       input: 0,
@@ -1661,8 +821,7 @@ function buildStreamError(modelId: string, error: unknown) {
   };
 }
 
-/** Profile-mode streamSimple: bypasses framework auth, uses vault directly. */
-function createProfileStreamSimple() {
+function createNormalModeStreamSimple(providerName: string) {
   return (
     model: { id: string; headers?: Record<string, string> },
     context: {
@@ -1674,171 +833,102 @@ function createProfileStreamSimple() {
       maxTokens?: number;
       reasoning?: string;
       signal?: AbortSignal;
+      apiKey?: string;
     },
   ) => {
-    const currentStore = loadProfileStore();
-
-    // Detect if /logout was called since last request
-    syncLogoutState(currentStore);
-
-    const activeProfile = getActiveProfile(currentStore);
-    if (!activeProfile) {
-      throw new Error("No active Qwen OAuth profile configured.");
-    }
-
-    const tokenPromise = ensureValidProfileToken(
-      currentStore,
-      activeProfile.key,
-    );
     const wrapper = createAssistantMessageEventStream();
+    const qwenHeaders = getProviderHeaders();
 
-    tokenPromise
-      .then((cred) => {
-        // After successful refresh, sync to auth.json so framework stays aware
-        syncCredentialToAuth(currentStore);
+    const run = async (apiKey: string) => {
+      const realStream = streamSimpleOpenAICompletions(
+        model as never,
+        context as never,
+        { ...options, apiKey, headers: qwenHeaders } as never,
+      );
+      for await (const event of realStream) {
+        wrapper.push(event);
+      }
+      wrapper.end(await realStream.result());
+    };
 
-        const baseUrl = cred.enterpriseUrl
-          ? normalizeBaseUrl(cred.enterpriseUrl)
-          : QWEN_DEFAULT_BASE_URL;
+    (async () => {
+      const initialKey =
+        options?.apiKey ||
+        (getAuthEntry(providerName)?.access as string | undefined);
 
-        const adaptedContext = {
-          messages: context.messages.map((m) => ({
-            role: m.role,
-            content: m.content,
-            toolCallId: (m as Record<string, unknown>).toolCallId as
-              | string
-              | undefined,
-            toolName: (m as Record<string, unknown>).toolName as
-              | string
-              | undefined,
-          })),
-          systemPrompt: context.systemPrompt,
-        };
-
-        const realStream = createQwenStream(
+      if (!initialKey) {
+        const errResult = buildStreamError(
+          providerName,
           model.id,
-          baseUrl,
-          model.headers,
-          adaptedContext,
-          cred.access,
-          {
-            temperature: options?.temperature,
-            maxTokens: options?.maxTokens,
-            reasoning: options?.reasoning,
-            signal: options?.signal,
-          },
+          new Error(`No Qwen OAuth access token for ${providerName}; run /login.`),
         );
+        wrapper.push({ type: "error", reason: "error", error: errResult });
+        wrapper.end(errResult);
+        return;
+      }
 
-        (async () => {
+      try {
+        await run(initialKey);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (
+          message.includes("401") ||
+          message.includes("token expired") ||
+          message.includes("invalid access token")
+        ) {
           try {
-            for await (const event of realStream) {
-              wrapper.push(event);
+            const currentAuth = getAuthEntry(providerName) as
+              | { refresh?: string; enterpriseUrl?: string }
+              | undefined;
+            if (!currentAuth?.refresh) {
+              throw new Error(
+                `Qwen OAuth refresh token is missing for ${providerName}; run /login again`,
+              );
             }
-            wrapper.end(await realStream.result());
-          } catch (error) {
-            const errResult = buildStreamError(model.id, error);
+
+            const refreshed = await refreshQwenToken({
+              access: "",
+              refresh: currentAuth.refresh,
+              expires: Date.now() - 1000,
+              enterpriseUrl: currentAuth.enterpriseUrl,
+            });
+            setAuthEntry(providerName, refreshed);
+            await run(refreshed.access);
+          } catch (refreshError) {
+            const errResult = buildStreamError(
+              providerName,
+              model.id,
+              refreshError,
+            );
             wrapper.push({ type: "error", reason: "error", error: errResult });
             wrapper.end(errResult);
           }
-        })();
-      })
-      .catch((error) => {
-        const errResult = buildStreamError(model.id, error);
+          return;
+        }
+
+        const errResult = buildStreamError(providerName, model.id, error);
         wrapper.push({ type: "error", reason: "error", error: errResult });
         wrapper.end(errResult);
-      });
+      }
+    })();
 
     return wrapper;
   };
 }
 
-function updateProfileStatus(
-  store: ProfileStoreData,
-  ctx: ExtensionContext,
+function registerAccountProvider(
+  pi: ExtensionAPI,
+  account: ManagedAccount,
 ): void {
-  syncLogoutState(store);
-  const active = getActiveProfile(store);
-  if (!active) return;
-
-  const cred = getCredential(store, active.key);
-  let status: string;
-
-  if (!cred || !cred.access) {
-    status = `Qwen: ${active.label} (not logged in)`;
-  } else if (Date.now() < cred.expires) {
-    status = `Qwen: ${active.label}`;
-  } else if (cred.refresh) {
-    status = `Qwen: ${active.label} (token expired — will refresh on next request)`;
-  } else {
-    status = `Qwen: ${active.label} (not logged in)`;
-  }
-
-  ctx.ui.setStatus("qwen-oauth-profiles", status);
-}
-
-export default function registerQwenOAuthProvider(pi: ExtensionAPI) {
-  // Always register payload normalization
-  pi.on("before_provider_request", (event) =>
-    normalizeQwenPortalPayload(event.payload),
-  );
-
-  if (PROFILES_ENABLED) {
-    registerProfileMode(pi);
-  } else {
-    registerNormalMode(pi);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Normal mode
-// ---------------------------------------------------------------------------
-
-function registerNormalMode(pi: ExtensionAPI): void {
-  // If a profile store exists (user previously used profile mode), sync
-  // the active profile's credentials to auth.json as a one-time migration.
-  const profilesPath = getProfilesFilePath();
-  if (fs.existsSync(profilesPath)) {
-    const store = loadProfileStore();
-    const active = getActiveProfile(store);
-    const cred = active ? getCredential(store, active.key) : undefined;
-    if (cred?.access && cred?.refresh) {
-      const authData = readAuthJson();
-      const existing = authData["qwen-oauth"];
-      if (
-        !existing ||
-        typeof existing !== "object" ||
-        (existing as Record<string, unknown>).access !== cred.access
-      ) {
-        authData["qwen-oauth"] = {
-          type: "oauth",
-          access: cred.access,
-          refresh: cred.refresh,
-          expires: cred.expires,
-          enterpriseUrl: cred.enterpriseUrl,
-        };
-        writeAuthJson(authData);
-        pi.on("session_start", async (_event, ctx) => {
-          ctx.ui.notify(
-            "Migrated active Qwen OAuth profile credentials to normal mode.",
-            "info",
-          );
-        });
-      }
-    }
-  }
-
-  pi.registerProvider("qwen-oauth", {
+  pi.registerProvider(account.provider, {
     baseUrl: QWEN_DEFAULT_BASE_URL,
-    apiKey: "QWEN_OAUTH_API_KEY",
+    apiKey: `QWEN_OAUTH_${account.provider.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_API_KEY`,
     api: "openai-completions",
-    headers: {
-      "X-DashScope-AuthType": "qwen-oauth",
-      "X-DashScope-UserAgent": QWEN_PORTAL_USER_AGENT,
-      "User-Agent": QWEN_PORTAL_USER_AGENT,
-    },
+    headers: getProviderHeaders(),
     models: PROVIDER_MODELS,
+    streamSimple: createNormalModeStreamSimple(account.provider),
     oauth: {
-      name: "Qwen OAuth",
+      name: getProviderOAuthName(account),
       login: loginQwen,
       refreshToken: refreshQwenToken,
       getApiKey: (credentials) => credentials.access,
@@ -1847,114 +937,293 @@ function registerNormalMode(pi: ExtensionAPI): void {
           credentials.enterpriseUrl as string | undefined,
         );
         return models.map((model) =>
-          model.provider === "qwen-oauth" ? { ...model, baseUrl } : model,
+          model.provider === account.provider ? { ...model, baseUrl } : model,
         );
       },
     },
   });
 }
 
-// ---------------------------------------------------------------------------
-// Profile mode
-// ---------------------------------------------------------------------------
+function refreshModelRegistry(ctx: ExtensionContext): void {
+  const modelRegistry = (ctx as unknown as {
+    modelRegistry?: { refresh?: () => void };
+  }).modelRegistry;
+  modelRegistry?.refresh?.();
+}
 
-function registerProfileMode(pi: ExtensionAPI): void {
-  const store = loadProfileStore();
-  const { migrated, loggedIn } = migrateOldCredentials(store);
+function unregisterAccountProvider(pi: ExtensionAPI, provider: string): void {
+  const api = pi as unknown as { unregisterProvider?: (name: string) => void };
+  api.unregisterProvider?.(provider);
+}
 
-  // Sync active profile credentials to auth.json so framework sees "logged in"
-  syncCredentialToAuth(store);
+function showLoginInstructions(
+  account: ManagedAccount,
+  ctx: ExtensionContext,
+): void {
+  ctx.ui.notify(
+    `Use /login and select "${getProviderOAuthName(account)}" to authenticate ${account.label}.`,
+    "info",
+  );
+}
 
-  registerProfileCommand(pi, store);
+function listAccountLines(store: AccountStoreData): string[] {
+  return store.accounts.map((account) =>
+    `${account.label} (${account.provider}) - ${getProviderStatusLabel(account.provider)}`,
+  );
+}
 
-  pi.on("session_start", async (_event, ctx) => {
-    if (migrated) {
-      if (loggedIn) {
-        ctx.ui.notify(
-          'Imported existing Qwen OAuth login into profile "Default".',
-          "info",
-        );
-      } else {
-        ctx.ui.notify(
-          'Found expired Qwen OAuth credentials in profile "Default" — please log in again.',
-          "warning",
-        );
-      }
+async function openAccountPanel(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+): Promise<void> {
+  while (true) {
+    const store = loadAccountStore();
+    const accountOptions = store.accounts.map((account) =>
+      `${account.label}  [${account.provider}]  ${getProviderStatusLabel(account.provider)}`,
+    );
+    const selected = await ctx.ui.select("Qwen OAuth Accounts", [
+      ...accountOptions,
+      "───",
+      "Add new account",
+    ]);
+    if (!selected) return;
+    if (selected === "───") continue;
+
+    if (selected === "Add new account") {
+      const label = await ctx.ui.input(
+        "Display label:",
+        `Account ${store.accounts.length + 1}`,
+      );
+      if (!label?.trim()) continue;
+      const account = addAccount(store, label.trim());
+      registerAccountProvider(pi, account);
+      refreshModelRegistry(ctx);
+      ctx.ui.notify(`Added account: ${account.label} (${account.provider})`, "info");
+      showLoginInstructions(account, ctx);
+      continue;
     }
-    updateProfileStatus(store, ctx);
-  });
 
-  pi.on("turn_end", (_event, ctx) => {
-    updateProfileStatus(store, ctx);
-  });
+    const selectedIndex = accountOptions.indexOf(selected);
+    const account = store.accounts[selectedIndex];
+    if (!account) continue;
 
-  pi.registerProvider("qwen-oauth", {
-    baseUrl: QWEN_DEFAULT_BASE_URL,
-    apiKey: "QWEN_OAUTH_PLACEHOLDER",
-    api: "openai-completions",
-    headers: {
-      "X-DashScope-AuthType": "qwen-oauth",
-      "X-DashScope-UserAgent": QWEN_PORTAL_USER_AGENT,
-      "User-Agent": QWEN_PORTAL_USER_AGENT,
+    const actions = [
+      getProviderAuthState(account.provider) === "logged-out"
+        ? "Login"
+        : "Login again",
+      "Rename label",
+      !isDefaultProvider(account.provider) ? "Remove account" : null,
+    ].filter(Boolean) as string[];
+    const action = await ctx.ui.select(
+      `${account.label} (${account.provider})`,
+      actions,
+    );
+    if (!action) continue;
+
+    if (action.includes("Login")) {
+      showLoginInstructions(account, ctx);
+      continue;
+    }
+
+    if (action.includes("Rename")) {
+      const nextLabel = await ctx.ui.input("New label:", account.label);
+      if (!nextLabel?.trim()) continue;
+      renameAccountLabel(store, account.provider, nextLabel.trim());
+      const updated = getAccount(loadAccountStore(), account.provider);
+      if (updated) {
+        registerAccountProvider(pi, updated);
+      }
+      refreshModelRegistry(ctx);
+      ctx.ui.notify(`Renamed ${account.provider} to ${nextLabel.trim()}`, "info");
+      continue;
+    }
+
+    if (action.includes("Remove")) {
+      const confirmed = await ctx.ui.confirm(
+        `Remove account "${account.label}"?`,
+        `This will delete the saved login for ${account.provider}.`,
+      );
+      if (!confirmed) continue;
+      removeAccount(store, account.provider);
+      removeAuthEntry(account.provider);
+      unregisterAccountProvider(pi, account.provider);
+      refreshModelRegistry(ctx);
+      ctx.ui.notify(`Removed account: ${account.provider}`, "info");
+    }
+  }
+}
+
+function registerAccountCommand(pi: ExtensionAPI): void {
+  pi.registerCommand("qwen-profile", {
+    description: "Manage Qwen OAuth accounts",
+    getArgumentCompletions: (prefix: string) => {
+      const store = loadAccountStore();
+      const trimmed = prefix.trim();
+      if (!trimmed) {
+        return ["list", "add", "login", "rename", "remove"].map((value) => ({
+          value,
+          label: value,
+        }));
+      }
+
+      const parts = trimmed.split(/\s+/);
+      if (parts.length === 1) {
+        const matches = ["list", "add", "login", "rename", "remove"].filter(
+          (value) => value.startsWith(parts[0]),
+        );
+        return matches.length > 0
+          ? matches.map((value) => ({ value, label: value }))
+          : null;
+      }
+
+      if (
+        parts[0] === "login" ||
+        parts[0] === "rename" ||
+        parts[0] === "remove"
+      ) {
+        const providerPrefix = parts[1] || "";
+        const matches = store.accounts
+          .map((account) => account.provider)
+          .filter((provider) => provider.startsWith(providerPrefix));
+        return matches.length > 0
+          ? matches.map((provider) => ({
+              value: `${parts[0]} ${provider}`,
+              label: provider,
+            }))
+          : null;
+      }
+
+      return null;
     },
-    models: PROVIDER_MODELS,
-    streamSimple: createProfileStreamSimple(),
-    oauth: {
-      name: "Qwen OAuth",
-      login: async (
-        callbacks: OAuthLoginCallbacks,
-      ): Promise<OAuthCredentials> => {
-        const currentStore = loadProfileStore();
-        const active = getActiveProfile(currentStore);
-        if (!active) {
-          throw new Error(
-            "No active Qwen OAuth profile. Run /qwen-profile to set one up.",
+    handler: async (args: string, ctx) => {
+      const store = loadAccountStore();
+      const trimmed = args.trim();
+
+      if (!ctx.hasUI) {
+        ctx.ui.notify(listAccountLines(store).join("\n"), "info");
+        return;
+      }
+
+      if (!trimmed) {
+        await openAccountPanel(pi, ctx);
+        return;
+      }
+
+      const parts = trimmed.split(/\s+/);
+      const subcommand = parts[0]?.toLowerCase();
+
+      if (subcommand === "list") {
+        ctx.ui.notify(listAccountLines(store).join("\n"), "info");
+        return;
+      }
+
+      if (subcommand === "add") {
+        const rawLabel = parts.slice(1).join(" ");
+        const label = rawLabel || `Account ${store.accounts.length + 1}`;
+        const account = addAccount(store, label);
+        registerAccountProvider(pi, account);
+        refreshModelRegistry(ctx);
+        ctx.ui.notify(`Added account: ${account.label} (${account.provider})`, "info");
+        showLoginInstructions(account, ctx);
+        return;
+      }
+
+      if (subcommand === "login" && parts[1]) {
+        const account = getAccount(store, parts[1]);
+        if (!account) {
+          ctx.ui.notify(`Unknown account: ${parts[1]}`, "error");
+          return;
+        }
+        showLoginInstructions(account, ctx);
+        return;
+      }
+
+      if (subcommand === "rename" && parts[1] && parts[2]) {
+        const provider = parts[1];
+        const label = parts.slice(2).join(" ");
+        if (!renameAccountLabel(store, provider, label)) {
+          ctx.ui.notify(`Account "${provider}" not found`, "error");
+          return;
+        }
+        const account = getAccount(loadAccountStore(), provider);
+        if (account) {
+          registerAccountProvider(pi, account);
+        }
+        refreshModelRegistry(ctx);
+        ctx.ui.notify(`Renamed ${provider} to: ${label}`, "info");
+        return;
+      }
+
+      if (subcommand === "remove" && parts[1]) {
+        const provider = parts[1];
+        if (!removeAccount(store, provider)) {
+          ctx.ui.notify(
+            isDefaultProvider(provider)
+              ? "Cannot remove the default account"
+              : `Account "${provider}" not found`,
+            isDefaultProvider(provider) ? "warning" : "error",
           );
+          return;
         }
-        const result = await loginProfile(currentStore, active.key, callbacks);
-        syncCredentialToAuth(currentStore);
-        return result;
-      },
-      refreshToken: async (
-        _credentials: OAuthCredentials,
-      ): Promise<OAuthCredentials> => {
-        // Always refresh the active profile — ignore framework's stale cred
-        const currentStore = loadProfileStore();
-        const active = getActiveProfile(currentStore);
-        if (!active) {
-          throw new Error("No active Qwen OAuth profile.");
-        }
-        const cred = getCredential(currentStore, active.key);
-        if (!cred?.refresh) {
-          throw new Error(
-            `Profile "${active.key}" has no refresh token; run /login qwen-oauth`,
-          );
-        }
-        const refreshed = await refreshProfileCredential(
-          currentStore,
-          active.key,
-        );
-        syncCredentialToAuth(currentStore);
-        return {
-          refresh: refreshed.refresh,
-          access: refreshed.access,
-          expires: refreshed.expires,
-          enterpriseUrl: refreshed.enterpriseUrl,
-        };
-      },
-      getApiKey: (credentials) => credentials.access,
-      modifyModels: (models, _credentials) => {
-        // Use vault's active profile enterpriseUrl, not framework's stale cred
-        const currentStore = loadProfileStore();
-        const active = getActiveProfile(currentStore);
-        const cred = active
-          ? getCredential(currentStore, active.key)
-          : undefined;
-        const baseUrl = normalizeBaseUrl(cred?.enterpriseUrl);
-        return models.map((model) =>
-          model.provider === "qwen-oauth" ? { ...model, baseUrl } : model,
-        );
-      },
+        removeAuthEntry(provider);
+        unregisterAccountProvider(pi, provider);
+        refreshModelRegistry(ctx);
+        ctx.ui.notify(`Removed account: ${provider}`, "info");
+        return;
+      }
+
+      ctx.ui.notify(
+        "Usage: /qwen-profile [list | add [label] | login <provider> | rename <provider> <label> | remove <provider>]",
+        "info",
+      );
     },
   });
+}
+
+function registerNormalMode(pi: ExtensionAPI): void {
+  const migrated = syncLegacyActiveProfileToBaseProvider();
+  const baseAccount =
+    getAccount(loadAccountStore(), "qwen-oauth") ||
+    getDefaultAccountStoreData().accounts[0];
+
+  registerAccountProvider(pi, baseAccount);
+
+  if (migrated) {
+    pi.on("session_start", async (_event, ctx) => {
+      ctx.ui.notify(
+        "Migrated active legacy Qwen OAuth profile credentials to qwen-oauth.",
+        "info",
+      );
+    });
+  }
+}
+
+function registerAccountMode(pi: ExtensionAPI): void {
+  const { migrated, store } = migrateLegacyProfileStore();
+  for (const account of store.accounts) {
+    registerAccountProvider(pi, account);
+  }
+  registerAccountCommand(pi);
+
+  if (migrated) {
+    pi.on("session_start", async (_event, ctx) => {
+      ctx.ui.notify(
+        "Migrated legacy Qwen profiles to per-account providers.",
+        "info",
+      );
+    });
+  }
+}
+
+export default function registerQwenOAuthProvider(pi: ExtensionAPI) {
+  pi.on("before_provider_request", (event) =>
+    normalizeQwenPortalPayload(event.payload),
+  );
+
+  if (profilesEnabled()) {
+    registerAccountMode(pi);
+    return;
+  }
+
+  registerNormalMode(pi);
 }
