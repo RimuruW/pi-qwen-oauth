@@ -326,9 +326,9 @@ test("registers extra providers from the multi-account store in profiles mode", 
 	});
 });
 
-test("migrates legacy profile store to provider-specific auth entries", async () => {
+test("profiles mode does not auto-migrate legacy profile stores at startup", async () => {
 	await withTempHome(async (homeDir) => {
-		writeJson(homeDir, "qwen-oauth-profiles.json", {
+		const legacyStore = {
 			version: 1,
 			activeProfile: "work",
 			profiles: [
@@ -349,38 +349,23 @@ test("migrates legacy profile store to provider-specific auth entries", async ()
 					enterpriseUrl: "dashscope.aliyuncs.com",
 				},
 			},
-		});
+		};
+		writeJson(homeDir, "qwen-oauth-profiles.json", legacyStore);
 		writeJson(homeDir, "auth.json", {});
 
-		await withEnv({ PI_QWEN_OAUTH_PROFILES: "true" }, () => registerExtension());
+		const { providers, commands } = await withEnv(
+			{ PI_QWEN_OAUTH_PROFILES: "true" },
+			() => registerExtension(),
+		);
 
-		assert.deepEqual(readJson(homeDir, "qwen-oauth-profiles.json"), {
-			version: 2,
-			accounts: [
-				{ provider: "qwen-oauth", label: "Work" },
-				{ provider: "qwen-oauth-2", label: "Default" },
-			],
-		});
-		assert.deepEqual(readJson(homeDir, "auth.json"), {
-			"qwen-oauth": {
-				type: "oauth",
-				access: "work-access",
-				refresh: "work-refresh",
-				expires: 222222,
-				enterpriseUrl: "dashscope.aliyuncs.com",
-			},
-			"qwen-oauth-2": {
-				type: "oauth",
-				access: "default-access",
-				refresh: "default-refresh",
-				expires: 111111,
-				enterpriseUrl: "portal.qwen.ai",
-			},
-		});
+		assert.deepEqual([...providers.keys()], ["qwen-oauth"]);
+		assert.ok(commands.has("qwen-profile"), "expected account management command to remain registered");
+		assert.deepEqual(readJson(homeDir, "qwen-oauth-profiles.json"), legacyStore);
+		assert.deepEqual(readJson(homeDir, "auth.json"), {});
 	});
 });
 
-test("normal mode legacy migration does not overwrite an existing qwen-oauth login", async () => {
+test("normal mode does not import active legacy profile credentials", async () => {
 	await withTempHome(async (homeDir) => {
 		writeJson(homeDir, "qwen-oauth-profiles.json", {
 			version: 1,
@@ -398,27 +383,11 @@ test("normal mode legacy migration does not overwrite an existing qwen-oauth log
 				},
 			},
 		});
-		writeJson(homeDir, "auth.json", {
-			"qwen-oauth": {
-				type: "oauth",
-				access: "current-access",
-				refresh: "current-refresh",
-				expires: 999999,
-				enterpriseUrl: "portal.qwen.ai",
-			},
-		});
+		writeJson(homeDir, "auth.json", {});
 
 		registerExtension();
 
-		assert.deepEqual(readJson(homeDir, "auth.json"), {
-			"qwen-oauth": {
-				type: "oauth",
-				access: "current-access",
-				refresh: "current-refresh",
-				expires: 999999,
-				enterpriseUrl: "portal.qwen.ai",
-			},
-		});
+		assert.deepEqual(readJson(homeDir, "auth.json"), {});
 	});
 });
 

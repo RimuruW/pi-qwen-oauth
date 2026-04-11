@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.1] — 2026-04-11
+
+### Features
+- switch to provider-per-account architecture for multi-account isolation
+
+### Bug Fixes
+- profiles mode and normal mode no longer auto-migrate legacy profile stores
+
+### Other
+- remove legacy global-active-profile migration code
+- add tests for multi-account registration, tri-state, and command behavior
+- restructure stream handling with async/await pattern
+- remove custom streamSimple wrapper
+
 ## [0.2.0] — 2026-04-08
 
 ### Features

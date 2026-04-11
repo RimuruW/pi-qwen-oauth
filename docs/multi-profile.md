@@ -71,14 +71,13 @@ Then select the corresponding model directly:
 /model qwen-oauth-3/coder-model
 ```
 
-## Migration from Legacy Profile Mode
+## Legacy Profile Mode
 
-If you previously used the old global-active-profile implementation, the first startup in multi-account mode automatically migrates:
+The old global-active-profile implementation is no longer supported.
 
-- the legacy profile list to provider-based account metadata
-- the legacy stored credentials to provider-specific auth entries
-
-The previously active legacy profile becomes `qwen-oauth` so existing model selections remain as stable as possible.
+- legacy `qwen-oauth-profiles.json` data is not migrated
+- legacy credentials are not imported into `qwen-oauth`
+- recreate accounts in the `version: 2` account-store format and run `/login` again if needed
 
 ## Limitations
 

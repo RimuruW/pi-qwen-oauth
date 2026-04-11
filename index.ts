@@ -109,25 +109,6 @@ interface AccountStoreData {
   accounts: ManagedAccount[];
 }
 
-interface LegacyProfileDef {
-  key: string;
-  label: string;
-}
-
-interface LegacyProfileCredential {
-  access: string;
-  refresh: string;
-  expires: number;
-  enterpriseUrl?: string;
-}
-
-interface LegacyProfileStoreData {
-  version: number;
-  activeProfile: string;
-  profiles: LegacyProfileDef[];
-  credentials: Record<string, LegacyProfileCredential>;
-}
-
 function getProfilesFilePath(): string {
   return path.join(os.homedir(), ".pi", "agent", "qwen-oauth-profiles.json");
 }
@@ -287,21 +268,6 @@ function getAuthEntry(provider: string): Record<string, unknown> | undefined {
   return entry as Record<string, unknown>;
 }
 
-function setAuthEntry(
-  provider: string,
-  credentials: OAuthCredentials,
-): void {
-  const authData = readAuthJson();
-  authData[provider] = {
-    type: "oauth",
-    access: credentials.access,
-    refresh: credentials.refresh,
-    expires: credentials.expires,
-    enterpriseUrl: credentials.enterpriseUrl,
-  };
-  writeAuthJson(authData);
-}
-
 function removeAuthEntry(provider: string): void {
   const authData = readAuthJson();
   if (!(provider in authData)) return;
@@ -338,90 +304,6 @@ function getProviderStatusLabel(provider: string): string {
     return "token expired — will refresh on next request";
   }
   return "not logged in";
-}
-
-// ---------------------------------------------------------------------------
-// Legacy profile-store migration
-// ---------------------------------------------------------------------------
-
-function isLegacyProfileStore(raw: unknown): raw is LegacyProfileStoreData {
-  return (
-    !!raw &&
-    typeof raw === "object" &&
-    Array.isArray((raw as LegacyProfileStoreData).profiles) &&
-    !!(raw as LegacyProfileStoreData).credentials &&
-    typeof (raw as LegacyProfileStoreData).credentials === "object"
-  );
-}
-
-function migrateLegacyProfileStore(): {
-  migrated: boolean;
-  store: AccountStoreData;
-} {
-  const raw = readRawProfilesFile();
-  if (!isLegacyProfileStore(raw)) {
-    return { migrated: false, store: loadAccountStore() };
-  }
-
-  const profiles = raw.profiles.filter(
-    (profile): profile is LegacyProfileDef =>
-      !!profile &&
-      typeof profile === "object" &&
-      typeof profile.key === "string" &&
-      typeof profile.label === "string",
-  );
-
-  const orderedProfiles = [
-    ...profiles.filter((profile) => profile.key === raw.activeProfile),
-    ...profiles.filter((profile) => profile.key !== raw.activeProfile),
-  ];
-
-  const accounts = orderedProfiles.map((profile, index) => ({
-    provider: index === 0 ? "qwen-oauth" : `qwen-oauth-${index + 1}`,
-    label: profile.label,
-  }));
-  const store: AccountStoreData = {
-    version: 2,
-    accounts: accounts.length > 0 ? accounts : getDefaultAccountStoreData().accounts,
-  };
-
-  for (const [index, profile] of orderedProfiles.entries()) {
-    const credentials = raw.credentials[profile.key];
-    if (!credentials?.access) continue;
-    setAuthEntry(index === 0 ? "qwen-oauth" : `qwen-oauth-${index + 1}`, {
-      access: credentials.access,
-      refresh: credentials.refresh || "",
-      expires: credentials.expires,
-      enterpriseUrl: credentials.enterpriseUrl,
-    });
-  }
-
-  saveAccountStore(store);
-  return { migrated: true, store };
-}
-
-function syncLegacyActiveProfileToBaseProvider(): boolean {
-  const raw = readRawProfilesFile();
-  if (!isLegacyProfileStore(raw)) return false;
-
-  const activeProfile = raw.profiles.find(
-    (profile) => profile.key === raw.activeProfile,
-  );
-  if (!activeProfile) return false;
-
-  const credentials = raw.credentials[activeProfile.key];
-  if (!credentials?.access) return false;
-
-  const existing = getAuthEntry("qwen-oauth");
-  if (existing?.access) return false;
-
-  setAuthEntry("qwen-oauth", {
-    access: credentials.access,
-    refresh: credentials.refresh || "",
-    expires: credentials.expires,
-    enterpriseUrl: credentials.enterpriseUrl,
-  });
-  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,38 +937,19 @@ function registerAccountCommand(pi: ExtensionAPI): void {
 }
 
 function registerNormalMode(pi: ExtensionAPI): void {
-  const migrated = syncLegacyActiveProfileToBaseProvider();
   const baseAccount =
     getAccount(loadAccountStore(), "qwen-oauth") ||
     getDefaultAccountStoreData().accounts[0];
 
   registerAccountProvider(pi, baseAccount);
-
-  if (migrated) {
-    pi.on("session_start", async (_event, ctx) => {
-      ctx.ui.notify(
-        "Migrated active legacy Qwen OAuth profile credentials to qwen-oauth.",
-        "info",
-      );
-    });
-  }
 }
 
 function registerAccountMode(pi: ExtensionAPI): void {
-  const { migrated, store } = migrateLegacyProfileStore();
+  const store = loadAccountStore();
   for (const account of store.accounts) {
     registerAccountProvider(pi, account);
   }
   registerAccountCommand(pi);
-
-  if (migrated) {
-    pi.on("session_start", async (_event, ctx) => {
-      ctx.ui.notify(
-        "Migrated legacy Qwen profiles to per-account providers.",
-        "info",
-      );
-    });
-  }
 }
 
 export default function registerQwenOAuthProvider(pi: ExtensionAPI) {
